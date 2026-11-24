@@ -14,5 +14,6 @@ __pycache__/
 sourceless-dashboard/certs/
 sourceless-dashboard/db_clienti.json
 sourceless-dashboard/audit_log.json
+sourceless-dashboard/yara_alerts.json
 sourceless-dashboard/*.tmp
 sourceless-dashboard/.tmp_*

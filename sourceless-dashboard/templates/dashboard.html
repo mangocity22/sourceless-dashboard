@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="csrf-token" content="{{ csrf_token }}">
+  <title>SourceLess OS // Support &amp; Telemetry Console</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{ url_for('static', filename='console.css') }}">
+</head>
+<body class="console-page">
+  <canvas id="sl-mesh"></canvas>
+
+  <div class="shell">
+    <header class="topbar">
+      <div class="brand-group">
+        <div class="brand-logo">{{ logo_svg | safe }}</div>
+        <div class="brand-titles">
+          <h1>SourceLess OS Fleet Console</h1>
+          <div class="live-telemetry">
+            <svg class="ecg-svg" viewBox="0 0 44 14" aria-hidden="true">
+              <polyline class="ecg-line" points="0,8 10,8 14,2 19,12 24,4 28,8 44,8" />
+            </svg>
+            <span>Live telemetry sync • 2s</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="topbar-actions">
+        <div class="key-pill">
+          <span class="lbl">Support Key (UTC)</span>
+          <span class="val" id="supportKeyVal">{{ support_key }}</span>
+          <button class="btn-mini-copy" type="button" id="copyKeyBtn">Copy</button>
+        </div>
+        <button class="btn-chip" type="button" id="openThreatsBtn">
+          Threat Alerts
+          <span class="count-pill" id="threatsBadge">0</span>
+        </button>
+        <button class="btn-chip" type="button" id="openAuditBtn">Audit Log</button>
+        <a href="/logout" class="btn-chip danger">Logout</a>
+      </div>
+    </header>
+
+    <section class="kpi-grid">
+      <div class="kpi-card">
+        <div class="kpi-label">Registered MiniPCs</div>
+        <div class="kpi-value" id="stat-total">0</div>
+        <div class="kpi-sub">Enrolled hardware identities</div>
+      </div>
+      <div class="kpi-card online">
+        <div class="kpi-label">Online Now</div>
+        <div class="kpi-value" id="stat-online">0</div>
+        <div class="kpi-sub">Heartbeat within 30s</div>
+      </div>
+      <div class="kpi-card secure">
+        <div class="kpi-label">Integrity Intact</div>
+        <div class="kpi-value" id="stat-secure">0</div>
+        <div class="kpi-sub">SELinux + Lockdown active</div>
+      </div>
+      <div class="kpi-card updates">
+        <div class="kpi-label">Updates Pending</div>
+        <div class="kpi-value" id="stat-updates">0</div>
+        <div class="kpi-sub">Staged for next restart</div>
+      </div>
+      <div class="kpi-card alert">
+        <div class="kpi-label">Security &amp; YARA Alerts</div>
+        <div class="kpi-value" id="stat-alerts">0</div>
+        <div class="kpi-sub">Tamper seals + quarantined files</div>
+      </div>
+    </section>
+
+    <div class="toolbar">
+      <div class="search-wrap">
+        <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.3-4.3"></path>
+        </svg>
+        <input id="searchInput" type="search" placeholder="Search by client name, hostname, HWID, IP, OS build or notes...">
+      </div>
+      <div class="filter-pills" id="filterPills">
+        <button class="filter-pill active" data-filter="all" type="button">All</button>
+        <button class="filter-pill" data-filter="online" type="button">Online</button>
+        <button class="filter-pill" data-filter="offline" type="button">Offline</button>
+        <button class="filter-pill" data-filter="modified" type="button">Modified</button>
+        <button class="filter-pill" data-filter="pending_update" type="button">Update Pending</button>
+        <button class="filter-pill" data-filter="support" type="button">Support Active</button>
+        <button class="filter-pill" data-filter="revoked" type="button">Revoked</button>
+      </div>
+    </div>
+
+    <div class="table-shell">
+      <table>
+        <thead>
+          <tr>
+            <th>Presence</th>
+            <th>Client / Device</th>
+            <th>OS Build &amp; Updates</th>
+            <th>Health &amp; Security</th>
+            <th>Network &amp; Sync</th>
+            <th>Remote Support</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="clients-tbody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="drawer-backdrop" id="backdrop"></div>
+
+  <!-- Device Inspector Drawer -->
+  <aside class="drawer" id="deviceDrawer" aria-hidden="true">
+    <div class="drawer-head">
+      <h2 id="drawerTitle">Device Inspector</h2>
+      <button class="btn-chip" type="button" id="closeDeviceDrawer">Close</button>
+    </div>
+    <div class="drawer-body">
+      <div class="meta-box" id="drawerMeta"></div>
+
+      <div>
+        <div class="section-lbl">Remote OS &amp; Update Controls</div>
+        <div class="cmd-grid">
+          <button class="btn btn-primary" type="button" id="cmdCheckUpdateBtn">Check for Updates</button>
+          <button class="btn btn-warn" type="button" id="cmdRebootBtn">Reboot Device</button>
+          <button class="btn btn-ghost" type="button" id="cmdStableBtn">Switch to Stable</button>
+          <button class="btn btn-ghost" type="button" id="cmdTestingBtn">Switch to Testing</button>
+        </div>
+      </div>
+
+      <div class="field-group">
+        <label for="metaClientName">Client / Company Name</label>
+        <input id="metaClientName" type="text" maxlength="80" placeholder="e.g. Clinic Alpha — Reception">
+      </div>
+      <div class="field-group">
+        <label for="metaNotes">Operator Notes</label>
+        <textarea id="metaNotes" rows="3" maxlength="500" placeholder="Hardware location, warranty notes, deployed configuration..."></textarea>
+      </div>
+      <button class="btn btn-primary" type="button" id="saveMetaBtn" style="padding: 11px 16px; justify-content: center;">Save Client Details</button>
+
+      <div style="border-top: 1px solid var(--border); padding-top: 14px; display: flex; flex-direction: column; gap: 9px;">
+        <div class="section-lbl" style="margin-bottom: 2px;">Access &amp; Enrollment Controls</div>
+        <button class="btn btn-warn" type="button" id="toggleRevokeBtn" style="justify-content: center;">Revoke Device Access</button>
+        <button class="btn btn-ghost" type="button" id="reenrollBtn" style="justify-content: center;">Allow One-Time Re-Enrollment</button>
+        <button class="btn btn-danger" type="button" id="drawerDeleteBtn" style="justify-content: center;">Delete Device Record</button>
+      </div>
+    </div>
+  </aside>
+
+  <!-- YARA Threat Alerts Drawer -->
+  <aside class="drawer" id="threatsDrawer" aria-hidden="true">
+    <div class="drawer-head">
+      <h2>YARA Threat Alerts</h2>
+      <div style="display: flex; gap: 8px;">
+        <button class="btn btn-ghost" type="button" id="clearThreatsBtn">Clear All</button>
+        <button class="btn-chip" type="button" id="closeThreatsDrawer">Close</button>
+      </div>
+    </div>
+    <div class="drawer-body" id="threatsList"></div>
+  </aside>
+
+  <!-- Audit Log Drawer -->
+  <aside class="drawer" id="auditDrawer" aria-hidden="true">
+    <div class="drawer-head">
+      <h2>Security &amp; Support Audit Log</h2>
+      <button class="btn-chip" type="button" id="closeAuditDrawer">Close</button>
+    </div>
+    <div class="drawer-body" id="auditList"></div>
+  </aside>
+
+  <!-- Custom Confirm Modal -->
+  <div class="modal" id="confirmModal" role="dialog" aria-modal="true">
+    <h3 id="modalTitle">Confirm Action</h3>
+    <p id="modalMsg"></p>
+    <div class="modal-btns">
+      <button class="btn btn-ghost" type="button" id="modalCancel">Cancel</button>
+      <button class="btn btn-danger" type="button" id="modalConfirm">Confirm</button>
+    </div>
+  </div>
+
+  <div class="toast-stack" id="toastStack"></div>
+
+  <script src="{{ url_for('static', filename='mesh.js') }}" defer></script>
+  <script src="{{ url_for('static', filename='console.js') }}" defer></script>
+</body>
+</html>

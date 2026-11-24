@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SourceLess OS // Support Gate</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Plus+Jakarta+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{ url_for('static', filename='console.css') }}">
+</head>
+<body class="auth-page">
+  <canvas id="sl-mesh"></canvas>
+  <div class="login-shell">
+    <div class="login-card" id="loginCard">
+      <div class="brand-head">
+        <div class="brand-mark">{{ logo_svg | safe }}</div>
+        <h1>SourceLess OS</h1>
+        <div class="brand-sub"><span class="dot-live"></span> Fleet Operations &amp; Support Gate</div>
+      </div>
+
+      {% if error %}
+      <div class="error-banner">{{ error }}</div>
+      {% endif %}
+
+      <form method="POST">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <div class="field">
+          <label for="username">Operator Username</label>
+          <input id="username" type="text" name="username" autocomplete="username" required autofocus>
+        </div>
+        <div class="field">
+          <label for="password">Passphrase</label>
+          <input id="password" type="password" name="password" autocomplete="current-password" required>
+        </div>
+        <button type="submit" class="btn-submit">Authenticate Console</button>
+      </form>
+      <div class="gate-foot">TLS TUNNEL • RATE-LIMIT GUARD ACTIVE</div>
+    </div>
+  </div>
+  <script src="{{ url_for('static', filename='mesh.js') }}" defer></script>
+</body>
+</html>
