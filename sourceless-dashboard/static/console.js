@@ -189,7 +189,9 @@
       t.classList.toggle('active', t.getAttribute('data-view') === viewName);
     });
     document.querySelectorAll('.view-panel').forEach((p) => {
-      p.classList.toggle('hidden', p.id !== 'view-' + viewName);
+      const shouldHide = p.id !== 'view-' + viewName;
+      p.classList.toggle('hidden', shouldHide);
+      p.hidden = shouldHide;
     });
     if (viewName === 'audit') fetchAuditLog();
     if (viewName === 'threats') renderThreatsTable();

@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Plus+Jakarta+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@600;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="{{ url_for('static', filename='console.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='console.css', v=asset_version) }}">
 </head>
 <body class="auth-page">
   <canvas id="sl-mesh"></canvas>
@@ -38,6 +38,6 @@
       <div class="gate-foot">TLS TUNNEL • RATE-LIMIT GUARD ACTIVE</div>
     </div>
   </div>
-  <script src="{{ url_for('static', filename='mesh.js') }}" defer></script>
+  <script src="{{ url_for('static', filename='mesh.js', v=asset_version) }}" defer></script>
 </body>
 </html>

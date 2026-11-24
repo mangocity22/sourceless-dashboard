@@ -60,6 +60,26 @@ app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 # Directory & File Paths
 DATA_DIR = "/opt/sourceless-dashboard" if os.path.isdir("/opt/sourceless-dashboard") else BASE_DIR
 CA_DIR = os.path.join(DATA_DIR, "certs")
+
+
+def compute_asset_version():
+    """Return a short content hash of static assets for Cloudflare/browser cache busting."""
+    h = hashlib.sha256()
+    static_dir = os.path.join(BASE_DIR, "static")
+    for rel in ("console.css", "console.js", "mesh.js"):
+        fpath = os.path.join(static_dir, rel)
+        if os.path.isfile(fpath):
+            with open(fpath, "rb") as fh:
+                h.update(fh.read())
+    return h.hexdigest()[:10]
+
+
+ASSET_VERSION = compute_asset_version()
+
+
+@app.context_processor
+def inject_global_template_vars():
+    return {"asset_version": ASSET_VERSION}
 CA_KEY = os.path.join(CA_DIR, "ca.key")
 CA_CRT = os.path.join(CA_DIR, "ca.crt")
 DB_FILE = os.path.join(DATA_DIR, "db_clienti.json")
@@ -507,7 +527,9 @@ def apply_security_headers(response):
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "same-origin"
     response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
-    if not request.path.startswith("/static/"):
+    if request.path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-cache, must-revalidate"
+    else:
         response.headers["Cache-Control"] = "no-store, max-age=0"
     return response
 

@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@600;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="{{ url_for('static', filename='console.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='console.css', v=asset_version) }}">
 </head>
 <body class="console-page"
       data-username="{{ current_user.username }}"
@@ -124,7 +124,7 @@
     </main>
 
     <!-- VIEW 2: AUDIT & ACCOUNTABILITY -->
-    <section class="view-panel hidden" id="view-audit">
+    <section class="view-panel hidden" id="view-audit" hidden>
       <div class="audit-filter-bar">
         <div class="search-wrap" style="max-width: 380px;">
           <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -187,7 +187,7 @@
     </section>
 
     <!-- VIEW 3: THREAT ALERTS -->
-    <section class="view-panel hidden" id="view-threats">
+    <section class="view-panel hidden" id="view-threats" hidden>
       <div class="toolbar">
         <div>
           <h2 style="font-family: 'Space Grotesk', sans-serif; font-size: 1.15rem;">YARA Endpoint Quarantine Feed</h2>
@@ -215,7 +215,7 @@
 
     <!-- VIEW 4: SUPPORT TEAM (ADMIN ONLY) -->
     {% if current_user.role == 'admin' %}
-    <section class="view-panel hidden" id="view-team">
+    <section class="view-panel hidden" id="view-team" hidden>
       <div class="team-grid">
         <div class="panel-card">
           <h3>Add Operator Account</h3>
@@ -325,7 +325,7 @@
 
   <div class="toast-stack" id="toastStack"></div>
 
-  <script src="{{ url_for('static', filename='mesh.js') }}" defer></script>
-  <script src="{{ url_for('static', filename='console.js') }}" defer></script>
+  <script src="{{ url_for('static', filename='mesh.js', v=asset_version) }}" defer></script>
+  <script src="{{ url_for('static', filename='console.js', v=asset_version) }}" defer></script>
 </body>
 </html>
