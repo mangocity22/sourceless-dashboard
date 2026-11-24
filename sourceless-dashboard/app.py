@@ -88,6 +88,7 @@ YARA_FILE = os.path.join(DATA_DIR, "yara_alerts.json")
 USERS_FILE = os.path.join(DATA_DIR, "users.json")
 
 ONLINE_THRESHOLD_SECONDS = 30
+SUPPORT_WAITING_TIMEOUT_SECONDS = 180
 MAX_AUDIT_ENTRIES = 2000
 MAX_YARA_ENTRIES = 200
 
@@ -103,6 +104,7 @@ os.makedirs(CA_DIR, exist_ok=True)
 DB_LOCK = threading.RLock()
 HWID_REGEX = re.compile(r"^[a-zA-Z0-9\-]{16,64}$")
 USERNAME_REGEX = re.compile(r"^[a-zA-Z0-9_.-]{3,32}$")
+UPTIME_RE = re.compile(r"^(?:(\d+)d\s+)?(\d+)h\s+(\d+)m$")
 
 SOURCELESS_LOGO_SVG = """
 <svg viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
@@ -347,6 +349,41 @@ def clamp_pct(val):
         return max(0, min(100, int(float(val))))
     except Exception:
         return None
+
+
+def parse_uptime_minutes(uptime_str):
+    if not uptime_str:
+        return None
+    m = UPTIME_RE.match(str(uptime_str).strip())
+    if not m:
+        return None
+    days = int(m.group(1) or 0)
+    hours = int(m.group(2) or 0)
+    mins = int(m.group(3) or 0)
+    return (days * 1440) + (hours * 60) + mins
+
+
+def auto_close_support_session(client_dict, hwid, reason_text):
+    """Reset active or pending remote support state and record an audit entry."""
+    client_dict["support_state"] = "idle"
+    client_dict["rustdesk_id"] = "N/A"
+    client_dict["rustdesk_pw"] = "N/A"
+    client_dict["support_updated_ts"] = time.time()
+    if client_dict.get("pending_cmd") == "start_support":
+        client_dict["pending_cmd"] = ""
+    append_audit(
+        "support_auto_closed",
+        hwid,
+        client_dict.get("hostname", hwid),
+        client_dict.get("ip", ""),
+        reason_text,
+        "info",
+        category="support",
+        actor="SYSTEM",
+        actor_name="Fleet Watchdog",
+        actor_role="system",
+        reason=reason_text,
+    )
 
 
 def require_reason(data, min_len=6):
@@ -658,8 +695,28 @@ def api_data():
     pending_updates = 0
 
     with DB_LOCK:
+        db_dirty = False
         for hwid, info in db_clienti.items():
             seen_ts = compute_last_seen_ts(info)
+            support_ts = float(info.get("support_updated_ts") or 0.0)
+            s_state = info.get("support_state", "idle")
+            effective_ts = max(seen_ts, support_ts)
+
+            if s_state == "approved" and effective_ts > 0 and (now_ts - effective_ts) > ONLINE_THRESHOLD_SECONDS:
+                auto_close_support_session(
+                    info,
+                    hwid,
+                    "Remote support session auto-closed (device went offline / shut down)",
+                )
+                db_dirty = True
+            elif s_state == "waiting" and support_ts > 0 and (now_ts - support_ts) > SUPPORT_WAITING_TIMEOUT_SECONDS:
+                auto_close_support_session(
+                    info,
+                    hwid,
+                    "Pending remote support request expired (no response or device offline)",
+                )
+                db_dirty = True
+
             is_online = seen_ts > 0 and (now_ts - seen_ts) <= ONLINE_THRESHOLD_SECONDS
             if is_online:
                 online_count += 1
@@ -672,6 +729,9 @@ def api_data():
             sanitized["last_seen_ts"] = seen_ts
             sanitized["online"] = is_online
             public_clients[hwid] = sanitized
+
+        if db_dirty:
+            save_db()
 
         total = len(public_clients)
         stats = {
@@ -1017,6 +1077,7 @@ def request_support(hwid):
             return jsonify({"error": "Client not found"}), 404
         db_clienti[hwid]["pending_cmd"] = "start_support"
         db_clienti[hwid]["support_state"] = "waiting"
+        db_clienti[hwid]["support_updated_ts"] = time.time()
         save_db()
         append_audit(
             "support_requested",
@@ -1045,6 +1106,7 @@ def stop_support(hwid):
             db_clienti[hwid]["support_state"] = "idle"
             db_clienti[hwid]["rustdesk_id"] = "N/A"
             db_clienti[hwid]["rustdesk_pw"] = "N/A"
+            db_clienti[hwid]["support_updated_ts"] = time.time()
             save_db()
             append_audit(
                 "support_stopped",
@@ -1136,6 +1198,12 @@ def device_cmd(hwid):
     with DB_LOCK:
         if hwid not in db_clienti:
             return jsonify({"error": "Client not found"}), 404
+        if cmd == "reboot_device" and db_clienti[hwid].get("support_state") in ("approved", "waiting"):
+            auto_close_support_session(
+                db_clienti[hwid],
+                hwid,
+                "Remote support session auto-closed (remote reboot initiated)",
+            )
         db_clienti[hwid]["pending_cmd"] = cmd
         save_db()
         append_audit(
@@ -1340,6 +1408,10 @@ def submit_credentials():
         if hwid in db_clienti:
             current_state = db_clienti[hwid].get("support_state")
             hostname = db_clienti[hwid].get("hostname", hwid)
+            now_ts = time.time()
+            db_clienti[hwid]["last_seen"] = get_local_time()
+            db_clienti[hwid]["last_seen_ts"] = now_ts
+            db_clienti[hwid]["support_updated_ts"] = now_ts
 
             if current_state != "waiting" and data.get("status") == "approved":
                 db_clienti[hwid]["pending_cmd"] = "stop_support"
@@ -1441,8 +1513,32 @@ def report_status():
             return jsonify({"error": "Incomplete data."}), 400
 
         command = "none"
+        now_ts = time.time()
         current_client = db_clienti.get(hwid, {})
         prev_status = current_client.get("status")
+        prev_seen_ts = compute_last_seen_ts(current_client)
+        prev_uptime = current_client.get("uptime", "")
+        incoming_uptime = str(data.get("uptime") or current_client.get("uptime", ""))[:32]
+
+        s_state = current_client.get("support_state", "idle")
+        support_ts = float(current_client.get("support_updated_ts") or 0.0)
+        if s_state in ("approved", "waiting"):
+            prev_mins = parse_uptime_minutes(prev_uptime)
+            new_mins = parse_uptime_minutes(incoming_uptime)
+            if prev_mins is not None and new_mins is not None and new_mins < prev_mins:
+                auto_close_support_session(
+                    current_client,
+                    hwid,
+                    "Remote support session auto-closed (device reboot detected)",
+                )
+            elif s_state == "approved" and prev_seen_ts > 0 and (now_ts - max(prev_seen_ts, support_ts)) > ONLINE_THRESHOLD_SECONDS:
+                auto_close_support_session(
+                    current_client,
+                    hwid,
+                    "Remote support session auto-closed (device reconnected after offline period)",
+                )
+                if not current_client.get("pending_cmd") and not current_client.get("pending_reinstate"):
+                    current_client["pending_cmd"] = "stop_support"
 
         pending_cmd = current_client.get("pending_cmd", "")
         pending_reinstate = current_client.get("pending_reinstate", False)
@@ -1499,11 +1595,12 @@ def report_status():
             "ip": client_ip,
             "status": status,
             "last_seen": get_local_time(),
-            "last_seen_ts": time.time(),
+            "last_seen_ts": now_ts,
             "pending_reinstate": pending_reinstate,
             "rustdesk_id": current_client.get("rustdesk_id", "N/A"),
             "rustdesk_pw": current_client.get("rustdesk_pw", "N/A"),
             "support_state": current_client.get("support_state", "idle"),
+            "support_updated_ts": current_client.get("support_updated_ts", 0.0),
             "pending_cmd": current_client.get("pending_cmd", ""),
             "allow_reenroll": current_client.get("allow_reenroll", False),
             "revoked": current_client.get("revoked", False),
