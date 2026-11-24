@@ -13,3 +13,6 @@ __pycache__/
 *.pyc
 sourceless-dashboard/certs/
 sourceless-dashboard/db_clienti.json
+sourceless-dashboard/audit_log.json
+sourceless-dashboard/*.tmp
+sourceless-dashboard/.tmp_*
