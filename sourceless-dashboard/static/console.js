@@ -121,7 +121,7 @@
       try {
         const j = await res.json();
         if (j && j.error) errText = j.error;
-      } catch (_) {}
+      } catch (_) { }
       showToast(errText, true);
       return null;
     }
@@ -256,7 +256,10 @@
     const entries = Object.entries(fleetData.clienti || {});
     entries.sort((a, b) => {
       if (!!b[1].online !== !!a[1].online) return b[1].online ? 1 : -1;
-      return (b[1].last_seen_ts || 0) - (a[1].last_seen_ts || 0);
+      const nameA = (a[1].client_name || a[1].hostname || a[0]).toLowerCase();
+      const nameB = (b[1].client_name || b[1].hostname || b[0]).toLowerCase();
+      const cmp = nameA.localeCompare(nameB, undefined, { numeric: true, sensitivity: 'base' });
+      return cmp !== 0 ? cmp : a[0].localeCompare(b[0]);
     });
 
     const filtered = entries.filter(([hwid, info]) => matchesFilter(hwid, info));
