@@ -1,0 +1,15 @@
+*.db
+*.db-journal
+*.db-wal
+*.sqlite*
+*.save
+*.bak
+*.log
+*.key
+*.pem
+*.crt
+.env
+__pycache__/
+*.pyc
+sourceless-dashboard/certs/
+sourceless-dashboard/db_clienti.json
