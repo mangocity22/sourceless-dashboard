@@ -1,8 +1,10 @@
-from flask import Flask, render_template, request, jsonify, redirect, url_for, session, abort
+from flask import Flask, Response, render_template, request, jsonify, redirect, url_for, session, abort
 from datetime import datetime, timezone, timedelta
 from functools import wraps
 from werkzeug.security import generate_password_hash, check_password_hash
+import csv
 import hashlib
+import io
 import json
 import os
 import re
@@ -63,10 +65,11 @@ CA_CRT = os.path.join(CA_DIR, "ca.crt")
 DB_FILE = os.path.join(DATA_DIR, "db_clienti.json")
 AUDIT_FILE = os.path.join(DATA_DIR, "audit_log.json")
 YARA_FILE = os.path.join(DATA_DIR, "yara_alerts.json")
+USERS_FILE = os.path.join(DATA_DIR, "users.json")
 
 ONLINE_THRESHOLD_SECONDS = 30
-MAX_AUDIT_ENTRIES = 150
-MAX_YARA_ENTRIES = 100
+MAX_AUDIT_ENTRIES = 2000
+MAX_YARA_ENTRIES = 200
 
 ALLOWED_REMOTE_CMDS = {
     "check_update",
@@ -74,10 +77,12 @@ ALLOWED_REMOTE_CMDS = {
     "set_channel_testing",
     "reboot_device",
 }
+REASON_REQUIRED_CMDS = {"reboot_device", "set_channel_stable", "set_channel_testing"}
 
 os.makedirs(CA_DIR, exist_ok=True)
 DB_LOCK = threading.RLock()
 HWID_REGEX = re.compile(r"^[a-zA-Z0-9\-]{16,64}$")
+USERNAME_REGEX = re.compile(r"^[a-zA-Z0-9_.-]{3,32}$")
 
 SOURCELESS_LOGO_SVG = """
 <svg viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
@@ -190,12 +195,16 @@ def load_json_file(filepath, fallback):
 db_clienti = load_json_file(DB_FILE, {})
 audit_log = load_json_file(AUDIT_FILE, [])
 yara_alerts = load_json_file(YARA_FILE, [])
+users_db = load_json_file(USERS_FILE, {})
+
 if not isinstance(db_clienti, dict):
     db_clienti = {}
 if not isinstance(audit_log, list):
     audit_log = []
 if not isinstance(yara_alerts, list):
     yara_alerts = []
+if not isinstance(users_db, dict):
+    users_db = {}
 
 
 def save_db():
@@ -203,18 +212,76 @@ def save_db():
         atomic_write_json(DB_FILE, db_clienti)
 
 
-def append_audit(event_type, hwid, hostname, ip, detail, severity="info"):
+def save_users():
     with DB_LOCK:
+        atomic_write_json(USERS_FILE, users_db)
+
+
+def seed_primary_admin():
+    """Ensures the primary administrator from env always exists and matches env credentials."""
+    with DB_LOCK:
+        existing = users_db.get(ADMIN_USER, {})
+        users_db[ADMIN_USER] = {
+            "username": ADMIN_USER,
+            "full_name": existing.get("full_name", "Lead Administrator"),
+            "role": "admin",
+            "password_hash": ADMIN_PASSWORD_HASH,
+            "active": True,
+            "protected": True,
+            "created_at": existing.get("created_at", get_local_time()),
+            "created_by": "system",
+            "last_login": existing.get("last_login", ""),
+        }
+        save_users()
+
+
+seed_primary_admin()
+
+
+def current_actor():
+    if session.get("logged_in"):
+        return (
+            session.get("username", ADMIN_USER),
+            session.get("display_name", session.get("username", ADMIN_USER)),
+            session.get("role", "support"),
+        )
+    return "SYSTEM", "Telemetry Agent", "system"
+
+
+def append_audit(
+    event_type,
+    hwid,
+    hostname,
+    ip,
+    detail,
+    severity="info",
+    category="system",
+    reason="",
+    actor=None,
+    actor_name=None,
+    actor_role=None,
+):
+    with DB_LOCK:
+        if actor is None:
+            actor, actor_name, actor_role = current_actor()
+        client_rec = db_clienti.get(hwid, {}) if hwid else {}
+        client_label = client_rec.get("client_name") or hostname or hwid or "System"
         entry = {
             "id": uuid.uuid4().hex[:10],
             "time": get_local_time(),
             "ts": round(time.time(), 2),
+            "actor": actor,
+            "actor_name": actor_name or actor,
+            "actor_role": actor_role or "system",
+            "category": category,
             "type": event_type,
             "severity": severity,
             "hwid": hwid or "SYSTEM",
             "hostname": hostname or "Console",
+            "client_label": client_label,
             "ip": ip or "127.0.0.1",
             "detail": detail,
+            "reason": (reason or "").strip(),
         }
         audit_log.insert(0, entry)
         del audit_log[MAX_AUDIT_ENTRIES:]
@@ -262,6 +329,97 @@ def clamp_pct(val):
         return None
 
 
+def require_reason(data, min_len=6):
+    reason = str((data or {}).get("reason", "")).strip()
+    if len(reason) < min_len or len(reason) > 400:
+        return None, (
+            jsonify({"error": f"Justification reason is required (between {min_len} and 400 characters)."}),
+            400,
+        )
+    return reason, None
+
+
+def normalize_audit_entry(raw):
+    ev = dict(raw)
+    ev.setdefault("actor", "SYSTEM")
+    ev.setdefault("actor_name", ev["actor"])
+    ev.setdefault("actor_role", "system")
+    ev.setdefault("category", "system")
+    ev.setdefault("reason", "")
+    ev.setdefault("client_label", ev.get("hostname") or ev.get("hwid") or "System")
+    return ev
+
+
+def filter_audit_entries(args):
+    q = (args.get("q") or "").strip().lower()
+    actor = (args.get("actor") or "").strip()
+    category = (args.get("category") or "").strip().lower()
+    severity = (args.get("severity") or "").strip().lower()
+    hwid_filter = (args.get("hwid") or "").strip()
+    days_raw = (args.get("days") or "").strip()
+    limit_raw = (args.get("limit") or "250").strip()
+
+    cutoff_ts = 0.0
+    if days_raw:
+        try:
+            days_val = float(days_raw)
+            if days_val > 0:
+                cutoff_ts = time.time() - (days_val * 86400.0)
+        except ValueError:
+            pass
+
+    try:
+        limit_val = max(1, min(2000, int(limit_raw)))
+    except ValueError:
+        limit_val = 250
+
+    results = []
+    actors_set = set()
+    with DB_LOCK:
+        for raw in audit_log:
+            ev = normalize_audit_entry(raw)
+            actors_set.add(ev["actor"])
+            if cutoff_ts > 0 and float(ev.get("ts") or 0) < cutoff_ts:
+                continue
+            if actor and ev["actor"] != actor:
+                continue
+            if category and ev["category"].lower() != category:
+                continue
+            if severity and ev["severity"].lower() != severity:
+                continue
+            if hwid_filter and ev.get("hwid") != hwid_filter:
+                continue
+            if q:
+                hay = " ".join(
+                    [
+                        str(ev.get("actor", "")),
+                        str(ev.get("actor_name", "")),
+                        str(ev.get("type", "")),
+                        str(ev.get("category", "")),
+                        str(ev.get("hwid", "")),
+                        str(ev.get("hostname", "")),
+                        str(ev.get("client_label", "")),
+                        str(ev.get("ip", "")),
+                        str(ev.get("detail", "")),
+                        str(ev.get("reason", "")),
+                    ]
+                ).lower()
+                if q not in hay:
+                    continue
+            results.append(ev)
+            if len(results) >= limit_val:
+                break
+
+    return results, sorted(actors_set)
+
+
+def csv_safe_cell(val):
+    s = "" if val is None else str(val)
+    if s and s[0] in ("=", "+", "-", "@"):
+        return "'" + s
+    return s
+
+
 # Generate Root CA certificate and key safely without shell=True
 if not os.path.exists(CA_KEY) or not os.path.exists(CA_CRT):
     subprocess.run(["openssl", "genrsa", "-out", CA_KEY, "4096"], check=False)
@@ -286,7 +444,7 @@ if not os.path.exists(CA_KEY) or not os.path.exists(CA_CRT):
     )
 
 
-# --- AUTH, CSRF & SECURITY HEADERS ---
+# --- AUTH, RBAC, CSRF & SECURITY HEADERS ---
 def get_csrf_token():
     token = session.get("csrf_token")
     if not token:
@@ -302,6 +460,24 @@ def login_required(f):
             if request.path.startswith("/api/") or request.is_json or request.method == "POST":
                 return jsonify({"error": "Session expired"}), 401
             return redirect(LOGIN_GATE_ROUTE)
+        uname = session.get("username")
+        with DB_LOCK:
+            u = users_db.get(uname)
+            if not u or not u.get("active", True):
+                session.clear()
+                if request.path.startswith("/api/") or request.is_json or request.method == "POST":
+                    return jsonify({"error": "Operator account disabled"}), 401
+                return redirect(LOGIN_GATE_ROUTE)
+        return f(*args, **kwargs)
+
+    return decorated_function
+
+
+def admin_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if session.get("role") != "admin":
+            return jsonify({"error": "Administrator privileges required for this action"}), 403
         return f(*args, **kwargs)
 
     return decorated_function
@@ -336,7 +512,7 @@ def apply_security_headers(response):
     return response
 
 
-# --- ROUTES ---
+# --- AUTH & VIEW ROUTES ---
 @app.route("/login")
 def legacy_login():
     abort(404)
@@ -361,21 +537,657 @@ def login():
         if not form_csrf or not secrets.compare_digest(csrf_token, form_csrf):
             error = "Security token mismatch. Please refresh and try again."
         else:
-            user_input = request.form.get("username", "")
-            pass_input = request.form.get("password", "")
-            if user_input == ADMIN_USER and check_password_hash(ADMIN_PASSWORD_HASH, pass_input):
+            user_input = (request.form.get("username") or "").strip()
+            pass_input = request.form.get("password") or ""
+            with DB_LOCK:
+                user_rec = users_db.get(user_input)
+                valid_user = bool(
+                    user_rec
+                    and user_rec.get("active", True)
+                    and check_password_hash(user_rec.get("password_hash", ""), pass_input)
+                )
+                if valid_user:
+                    user_rec["last_login"] = get_local_time()
+                    save_users()
+
+            if valid_user:
                 reset_failed_attempts(client_ip)
                 session["logged_in"] = True
+                session["username"] = user_rec["username"]
+                session["display_name"] = user_rec.get("full_name") or user_rec["username"]
+                session["role"] = user_rec.get("role", "support")
                 session["csrf_token"] = secrets.token_hex(32)
-                append_audit("admin_login", "CONSOLE", "Operator", client_ip, f"Admin '{ADMIN_USER}' signed in", "ok")
+                append_audit(
+                    "operator_login",
+                    "CONSOLE",
+                    "Console",
+                    client_ip,
+                    f"Operator '{user_rec['username']}' ({session['role']}) authenticated",
+                    "ok",
+                    category="auth",
+                    actor=user_rec["username"],
+                    actor_name=session["display_name"],
+                    actor_role=session["role"],
+                )
                 return redirect(url_for("dashboard"))
+
             record_failed_attempt(client_ip)
-            append_audit("login_failed", "CONSOLE", "Operator", client_ip, "Failed console authentication attempt", "warn")
-            error = "Invalid username or password!"
+            append_audit(
+                "login_failed",
+                "CONSOLE",
+                "Console",
+                client_ip,
+                f"Failed login attempt for username '{user_input or 'unknown'}'",
+                "warn",
+                category="auth",
+                actor=user_input or "ANONYMOUS",
+                actor_name=user_input or "Unknown",
+                actor_role="anonymous",
+            )
+            error = "Invalid username, passphrase, or disabled account."
 
     return render_template("login.html", error=error, csrf_token=csrf_token, logo_svg=SOURCELESS_LOGO_SVG)
 
 
+@app.route("/logout")
+def logout():
+    if session.get("logged_in"):
+        actor, actor_name, actor_role = current_actor()
+        append_audit(
+            "operator_logout",
+            "CONSOLE",
+            "Console",
+            get_client_ip(),
+            f"Operator '{actor}' signed out",
+            "info",
+            category="auth",
+            actor=actor,
+            actor_name=actor_name,
+            actor_role=actor_role,
+        )
+    session.clear()
+    return redirect(LOGIN_GATE_ROUTE)
+
+
+@app.route("/")
+@login_required
+def dashboard():
+    return render_template(
+        "dashboard.html",
+        support_key=get_today_support_key(),
+        csrf_token=get_csrf_token(),
+        logo_svg=SOURCELESS_LOGO_SVG,
+        current_user={
+            "username": session.get("username", ADMIN_USER),
+            "display_name": session.get("display_name", ADMIN_USER),
+            "role": session.get("role", "support"),
+        },
+    )
+
+
+# --- CONSOLE DATA & AUDIT APIs ---
+@app.route("/api/data")
+@login_required
+def api_data():
+    now_ts = time.time()
+    public_clients = {}
+    online_count = 0
+    secure_count = 0
+    pending_updates = 0
+
+    with DB_LOCK:
+        for hwid, info in db_clienti.items():
+            seen_ts = compute_last_seen_ts(info)
+            is_online = seen_ts > 0 and (now_ts - seen_ts) <= ONLINE_THRESHOLD_SECONDS
+            if is_online:
+                online_count += 1
+            if not info.get("revoked") and info.get("status") == "Integru":
+                secure_count += 1
+            if info.get("update_status") == "pending_restart":
+                pending_updates += 1
+
+            sanitized = {k: v for k, v in info.items() if k != "token"}
+            sanitized["last_seen_ts"] = seen_ts
+            sanitized["online"] = is_online
+            public_clients[hwid] = sanitized
+
+        total = len(public_clients)
+        stats = {
+            "total": total,
+            "online": online_count,
+            "secure": secure_count,
+            "compromised": total - secure_count,
+            "pending_updates": pending_updates,
+            "yara_alerts": len(yara_alerts),
+        }
+        recent_yara = list(yara_alerts[:60])
+
+    return jsonify(
+        {
+            "clienti": public_clients,
+            "stats": stats,
+            "yara_alerts": recent_yara,
+            "current_user": {
+                "username": session.get("username", ADMIN_USER),
+                "display_name": session.get("display_name", ADMIN_USER),
+                "role": session.get("role", "support"),
+            },
+        }
+    )
+
+
+@app.route("/api/audit")
+@login_required
+def api_audit():
+    entries, actors = filter_audit_entries(request.args)
+    return jsonify({"entries": entries, "actors": actors, "total_matching": len(entries)})
+
+
+@app.route("/api/audit/export.csv")
+@login_required
+def export_audit_csv():
+    args = dict(request.args)
+    args["limit"] = "2000"
+    entries, _ = filter_audit_entries(args)
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(
+        [
+            "Timestamp",
+            "Operator",
+            "Display Name",
+            "Role",
+            "Category",
+            "Action",
+            "Severity",
+            "Target HWID",
+            "Target Device",
+            "IP Address",
+            "Details",
+            "Operator Justification",
+        ]
+    )
+    for ev in entries:
+        writer.writerow(
+            [
+                csv_safe_cell(ev.get("time", "")),
+                csv_safe_cell(ev.get("actor", "")),
+                csv_safe_cell(ev.get("actor_name", "")),
+                csv_safe_cell(ev.get("actor_role", "")),
+                csv_safe_cell(ev.get("category", "")),
+                csv_safe_cell(ev.get("type", "")),
+                csv_safe_cell(ev.get("severity", "")),
+                csv_safe_cell(ev.get("hwid", "")),
+                csv_safe_cell(ev.get("client_label", "")),
+                csv_safe_cell(ev.get("ip", "")),
+                csv_safe_cell(ev.get("detail", "")),
+                csv_safe_cell(ev.get("reason", "")),
+            ]
+        )
+
+    actor, actor_name, actor_role = current_actor()
+    append_audit(
+        "audit_exported",
+        "CONSOLE",
+        "Console",
+        get_client_ip(),
+        f"Exported {len(entries)} audit log rows to CSV",
+        "info",
+        category="auth",
+        actor=actor,
+        actor_name=actor_name,
+        actor_role=actor_role,
+    )
+
+    return Response(
+        buf.getvalue(),
+        mimetype="text/csv; charset=utf-8",
+        headers={"Content-Disposition": "attachment; filename=sourceless-audit-log.csv"},
+    )
+
+
+# --- TEAM MANAGEMENT ROUTES (ADMIN ONLY) ---
+@app.route("/api/team")
+@login_required
+@admin_required
+def api_team():
+    with DB_LOCK:
+        members = []
+        for u in users_db.values():
+            members.append(
+                {
+                    "username": u.get("username"),
+                    "full_name": u.get("full_name", ""),
+                    "role": u.get("role", "support"),
+                    "active": bool(u.get("active", True)),
+                    "protected": bool(u.get("protected", False)),
+                    "created_at": u.get("created_at", ""),
+                    "created_by": u.get("created_by", ""),
+                    "last_login": u.get("last_login", ""),
+                }
+            )
+    members.sort(key=lambda m: (0 if m["protected"] else 1, m["username"]))
+    return jsonify({"members": members})
+
+
+@app.route("/api/team/add", methods=["POST"])
+@login_required
+@admin_required
+@csrf_protected
+def api_team_add():
+    data = request.get_json(silent=True) or {}
+    username = str(data.get("username", "")).strip()
+    full_name = str(data.get("full_name", "")).strip()[:64]
+    role = str(data.get("role", "support")).strip().lower()
+    password = str(data.get("password", ""))
+    reason, err = require_reason(data)
+    if err:
+        return err
+
+    if not USERNAME_REGEX.match(username):
+        return jsonify({"error": "Username must be 3-32 characters (letters, digits, _, ., -)."}), 400
+    if role not in ("admin", "support"):
+        return jsonify({"error": "Role must be 'admin' or 'support'."}), 400
+    if len(password) < 8:
+        return jsonify({"error": "Password must be at least 8 characters long."}), 400
+
+    with DB_LOCK:
+        if username in users_db:
+            return jsonify({"error": "Username already exists."}), 409
+        actor, _, _ = current_actor()
+        users_db[username] = {
+            "username": username,
+            "full_name": full_name or username,
+            "role": role,
+            "password_hash": generate_password_hash(password),
+            "active": True,
+            "protected": False,
+            "created_at": get_local_time(),
+            "created_by": actor,
+            "last_login": "",
+        }
+        save_users()
+        append_audit(
+            "operator_created",
+            "TEAM",
+            username,
+            get_client_ip(),
+            f"Created {role} operator account '{username}' ({full_name or username})",
+            "ok",
+            category="team",
+            reason=reason,
+        )
+    return jsonify({"status": "ok"})
+
+
+@app.route("/api/team/toggle/<target_user>", methods=["POST"])
+@login_required
+@admin_required
+@csrf_protected
+def api_team_toggle(target_user):
+    data = request.get_json(silent=True) or {}
+    reason, err = require_reason(data)
+    if err:
+        return err
+
+    with DB_LOCK:
+        rec = users_db.get(target_user)
+        if not rec:
+            return jsonify({"error": "Operator not found."}), 404
+        if rec.get("protected") or target_user == ADMIN_USER:
+            return jsonify({"error": "Primary administrator account cannot be disabled."}), 400
+        new_active = not bool(rec.get("active", True))
+        rec["active"] = new_active
+        save_users()
+        append_audit(
+            "operator_enabled" if new_active else "operator_disabled",
+            "TEAM",
+            target_user,
+            get_client_ip(),
+            f"{'Enabled' if new_active else 'Disabled'} operator account '{target_user}'",
+            "warn" if not new_active else "ok",
+            category="team",
+            reason=reason,
+        )
+    return jsonify({"status": "ok", "active": new_active})
+
+
+@app.route("/api/team/reset_password/<target_user>", methods=["POST"])
+@login_required
+@admin_required
+@csrf_protected
+def api_team_reset_password(target_user):
+    data = request.get_json(silent=True) or {}
+    new_password = str(data.get("password", ""))
+    reason, err = require_reason(data)
+    if err:
+        return err
+    if len(new_password) < 8:
+        return jsonify({"error": "Password must be at least 8 characters long."}), 400
+
+    with DB_LOCK:
+        rec = users_db.get(target_user)
+        if not rec:
+            return jsonify({"error": "Operator not found."}), 404
+        if rec.get("protected") or target_user == ADMIN_USER:
+            return jsonify({"error": "Primary administrator password is managed via environment config."}), 400
+        rec["password_hash"] = generate_password_hash(new_password)
+        save_users()
+        append_audit(
+            "operator_password_reset",
+            "TEAM",
+            target_user,
+            get_client_ip(),
+            f"Reset passphrase for operator '{target_user}'",
+            "warn",
+            category="team",
+            reason=reason,
+        )
+    return jsonify({"status": "ok"})
+
+
+@app.route("/api/team/delete/<target_user>", methods=["POST"])
+@login_required
+@admin_required
+@csrf_protected
+def api_team_delete(target_user):
+    data = request.get_json(silent=True) or {}
+    reason, err = require_reason(data)
+    if err:
+        return err
+
+    with DB_LOCK:
+        rec = users_db.get(target_user)
+        if not rec:
+            return jsonify({"error": "Operator not found."}), 404
+        if rec.get("protected") or target_user == ADMIN_USER or target_user == session.get("username"):
+            return jsonify({"error": "Primary or active session administrator cannot be deleted."}), 400
+        users_db.pop(target_user, None)
+        save_users()
+        append_audit(
+            "operator_deleted",
+            "TEAM",
+            target_user,
+            get_client_ip(),
+            f"Deleted operator account '{target_user}'",
+            "critical",
+            category="team",
+            reason=reason,
+        )
+    return jsonify({"status": "ok"})
+
+
+# --- DEVICE ACTION ROUTES (WITH MANDATORY JUSTIFICATION) ---
+@app.route("/reinstate/<hwid>", methods=["POST"])
+@login_required
+@csrf_protected
+def reinstate_client(hwid):
+    if not is_valid_hwid(hwid):
+        return jsonify({"error": "Invalid HWID"}), 400
+    data = request.get_json(silent=True) or {}
+    reason, err = require_reason(data)
+    if err:
+        return err
+
+    with DB_LOCK:
+        if hwid not in db_clienti:
+            return jsonify({"error": "Client not found"}), 404
+        db_clienti[hwid]["pending_reinstate"] = True
+        db_clienti[hwid]["status"] = "Integru"
+        save_db()
+        append_audit(
+            "tamper_reinstated",
+            hwid,
+            db_clienti[hwid].get("hostname", hwid),
+            get_client_ip(),
+            "Operator cleared tamper seal and reinstated device integrity",
+            "warn",
+            category="security",
+            reason=reason,
+        )
+    return jsonify({"status": "ok"})
+
+
+@app.route("/delete_client/<hwid>", methods=["POST"])
+@login_required
+@admin_required
+@csrf_protected
+def delete_client(hwid):
+    if not is_valid_hwid(hwid):
+        return jsonify({"error": "Invalid HWID"}), 400
+    data = request.get_json(silent=True) or {}
+    reason, err = require_reason(data)
+    if err:
+        return err
+
+    with DB_LOCK:
+        if hwid in db_clienti:
+            removed = db_clienti.pop(hwid, None) or {}
+            save_db()
+            append_audit(
+                "device_deleted",
+                hwid,
+                removed.get("hostname", hwid),
+                get_client_ip(),
+                "Deleted device record from fleet database",
+                "critical",
+                category="access",
+                reason=reason,
+            )
+            return jsonify({"status": "ok"})
+    return jsonify({"error": "Client not found"}), 404
+
+
+@app.route("/request_support/<hwid>", methods=["POST"])
+@login_required
+@csrf_protected
+def request_support(hwid):
+    if not is_valid_hwid(hwid):
+        return jsonify({"error": "Invalid HWID"}), 400
+    data = request.get_json(silent=True) or {}
+    reason, err = require_reason(data)
+    if err:
+        return err
+
+    with DB_LOCK:
+        if hwid not in db_clienti:
+            return jsonify({"error": "Client not found"}), 404
+        db_clienti[hwid]["pending_cmd"] = "start_support"
+        db_clienti[hwid]["support_state"] = "waiting"
+        save_db()
+        append_audit(
+            "support_requested",
+            hwid,
+            db_clienti[hwid].get("hostname", hwid),
+            get_client_ip(),
+            "Dispatched interactive RustDesk support authorization prompt",
+            "info",
+            category="support",
+            reason=reason,
+        )
+    return jsonify({"status": "ok"})
+
+
+@app.route("/stop_support/<hwid>", methods=["POST"])
+@login_required
+@csrf_protected
+def stop_support(hwid):
+    if not is_valid_hwid(hwid):
+        return jsonify({"error": "Invalid HWID"}), 400
+    data = request.get_json(silent=True) or {}
+    reason = str(data.get("reason", "")).strip()[:400]
+    with DB_LOCK:
+        if hwid in db_clienti:
+            db_clienti[hwid]["pending_cmd"] = "stop_support"
+            db_clienti[hwid]["support_state"] = "idle"
+            db_clienti[hwid]["rustdesk_id"] = "N/A"
+            db_clienti[hwid]["rustdesk_pw"] = "N/A"
+            save_db()
+            append_audit(
+                "support_stopped",
+                hwid,
+                db_clienti[hwid].get("hostname", hwid),
+                get_client_ip(),
+                "Terminated or reset remote support session",
+                "info",
+                category="support",
+                reason=reason or "Session closed or rejected reset",
+            )
+    return jsonify({"status": "ok"})
+
+
+@app.route("/update_meta/<hwid>", methods=["POST"])
+@login_required
+@csrf_protected
+def update_meta(hwid):
+    if not is_valid_hwid(hwid):
+        return jsonify({"error": "Invalid HWID"}), 400
+    data = request.get_json(silent=True) or {}
+    client_name = str(data.get("client_name", ""))[:80].strip()
+    notes = str(data.get("notes", ""))[:500].strip()
+    with DB_LOCK:
+        if hwid not in db_clienti:
+            return jsonify({"error": "Client not found"}), 404
+        db_clienti[hwid]["client_name"] = client_name
+        db_clienti[hwid]["notes"] = notes
+        save_db()
+        append_audit(
+            "meta_updated",
+            hwid,
+            db_clienti[hwid].get("hostname", hwid),
+            get_client_ip(),
+            f"Updated device label to '{client_name or 'Unassigned'}'",
+            "info",
+            category="access",
+        )
+    return jsonify({"status": "ok"})
+
+
+@app.route("/allow_reenroll/<hwid>", methods=["POST"])
+@login_required
+@admin_required
+@csrf_protected
+def allow_reenroll(hwid):
+    if not is_valid_hwid(hwid):
+        return jsonify({"error": "Invalid HWID"}), 400
+    data = request.get_json(silent=True) or {}
+    reason, err = require_reason(data)
+    if err:
+        return err
+
+    with DB_LOCK:
+        if hwid not in db_clienti:
+            return jsonify({"error": "Client not found"}), 404
+        db_clienti[hwid]["allow_reenroll"] = True
+        save_db()
+        append_audit(
+            "reenroll_approved",
+            hwid,
+            db_clienti[hwid].get("hostname", hwid),
+            get_client_ip(),
+            "Approved one-time HWID re-enrollment",
+            "warn",
+            category="access",
+            reason=reason,
+        )
+    return jsonify({"status": "ok"})
+
+
+@app.route("/device_cmd/<hwid>", methods=["POST"])
+@login_required
+@csrf_protected
+def device_cmd(hwid):
+    if not is_valid_hwid(hwid):
+        return jsonify({"error": "Invalid HWID"}), 400
+    data = request.get_json(silent=True) or {}
+    cmd = str(data.get("cmd", "")).strip()
+    if cmd not in ALLOWED_REMOTE_CMDS:
+        return jsonify({"error": "Unsupported command"}), 400
+
+    reason = str(data.get("reason", "")).strip()[:400]
+    if cmd in REASON_REQUIRED_CMDS:
+        reason, err = require_reason(data)
+        if err:
+            return err
+
+    with DB_LOCK:
+        if hwid not in db_clienti:
+            return jsonify({"error": "Client not found"}), 404
+        db_clienti[hwid]["pending_cmd"] = cmd
+        save_db()
+        append_audit(
+            "remote_command",
+            hwid,
+            db_clienti[hwid].get("hostname", hwid),
+            get_client_ip(),
+            f"Queued remote command: {cmd}",
+            "warn" if cmd in REASON_REQUIRED_CMDS else "info",
+            category="updates",
+            reason=reason,
+        )
+    return jsonify({"status": "ok"})
+
+
+@app.route("/toggle_revoke/<hwid>", methods=["POST"])
+@login_required
+@admin_required
+@csrf_protected
+def toggle_revoke(hwid):
+    if not is_valid_hwid(hwid):
+        return jsonify({"error": "Invalid HWID"}), 400
+    data = request.get_json(silent=True) or {}
+    reason, err = require_reason(data)
+    if err:
+        return err
+
+    with DB_LOCK:
+        if hwid not in db_clienti:
+            return jsonify({"error": "Client not found"}), 404
+        new_val = not bool(db_clienti[hwid].get("revoked", False))
+        db_clienti[hwid]["revoked"] = new_val
+        save_db()
+        append_audit(
+            "device_revoked" if new_val else "device_restored",
+            hwid,
+            db_clienti[hwid].get("hostname", hwid),
+            get_client_ip(),
+            "Device access revoked by administrator" if new_val else "Device access restored by administrator",
+            "critical" if new_val else "ok",
+            category="access",
+            reason=reason,
+        )
+    return jsonify({"status": "ok", "revoked": new_val})
+
+
+@app.route("/clear_yara_alerts", methods=["POST"])
+@login_required
+@admin_required
+@csrf_protected
+def clear_yara_alerts():
+    data = request.get_json(silent=True) or {}
+    reason, err = require_reason(data)
+    if err:
+        return err
+
+    with DB_LOCK:
+        count = len(yara_alerts)
+        yara_alerts.clear()
+        atomic_write_json(YARA_FILE, yara_alerts)
+        append_audit(
+            "yara_cleared",
+            "CONSOLE",
+            "Console",
+            get_client_ip(),
+            f"Cleared {count} YARA threat alert record(s)",
+            "warn",
+            category="yara",
+            reason=reason,
+        )
+    return jsonify({"status": "ok"})
+
+
+# --- DEVICE CLIENT ENDPOINTS ---
 @app.route("/api/register", methods=["POST"])
 def register():
     data = request.get_json(silent=True) or {}
@@ -398,6 +1210,10 @@ def register():
                     client_ip,
                     "Blocked unauthorized re-enrollment attempt on already registered HWID",
                     "critical",
+                    category="security",
+                    actor="DEVICE",
+                    actor_name=existing.get("hostname", hwid),
+                    actor_role="device",
                 )
                 return jsonify({"error": "Device already enrolled. Admin re-enrollment approval required."}), 409
 
@@ -477,222 +1293,13 @@ def register():
             client_ip,
             "Device certificate and telemetry token issued",
             "ok",
+            category="access",
+            actor="DEVICE",
+            actor_name=prev.get("hostname") or "New Device",
+            actor_role="device",
         )
 
     return jsonify({"status": "registered", "token": device_token, "certificate": signed_cert})
-
-
-@app.route("/logout")
-def logout():
-    session.clear()
-    return redirect(LOGIN_GATE_ROUTE)
-
-
-@app.route("/")
-@login_required
-def dashboard():
-    return render_template(
-        "dashboard.html",
-        support_key=get_today_support_key(),
-        csrf_token=get_csrf_token(),
-        logo_svg=SOURCELESS_LOGO_SVG,
-    )
-
-
-@app.route("/api/data")
-@login_required
-def api_data():
-    now_ts = time.time()
-    public_clients = {}
-    online_count = 0
-    secure_count = 0
-    pending_updates = 0
-
-    with DB_LOCK:
-        for hwid, info in db_clienti.items():
-            seen_ts = compute_last_seen_ts(info)
-            is_online = seen_ts > 0 and (now_ts - seen_ts) <= ONLINE_THRESHOLD_SECONDS
-            if is_online:
-                online_count += 1
-            if not info.get("revoked") and info.get("status") == "Integru":
-                secure_count += 1
-            if info.get("update_status") == "pending_restart":
-                pending_updates += 1
-
-            sanitized = {k: v for k, v in info.items() if k != "token"}
-            sanitized["last_seen_ts"] = seen_ts
-            sanitized["online"] = is_online
-            public_clients[hwid] = sanitized
-
-        total = len(public_clients)
-        stats = {
-            "total": total,
-            "online": online_count,
-            "secure": secure_count,
-            "compromised": total - secure_count,
-            "pending_updates": pending_updates,
-            "yara_alerts": len(yara_alerts),
-        }
-        recent_audit = list(audit_log[:40])
-        recent_yara = list(yara_alerts[:40])
-
-    return jsonify(
-        {
-            "clienti": public_clients,
-            "stats": stats,
-            "audit_log": recent_audit,
-            "yara_alerts": recent_yara,
-        }
-    )
-
-
-@app.route("/reinstate/<hwid>", methods=["POST"])
-@login_required
-@csrf_protected
-def reinstate_client(hwid):
-    if not is_valid_hwid(hwid):
-        return jsonify({"error": "Invalid HWID"}), 400
-    with DB_LOCK:
-        if hwid in db_clienti:
-            db_clienti[hwid]["pending_reinstate"] = True
-            db_clienti[hwid]["status"] = "Integru"
-            save_db()
-            append_audit("tamper_reinstated", hwid, db_clienti[hwid].get("hostname", hwid), get_client_ip(), "Operator cleared tamper seal", "ok")
-    return jsonify({"status": "ok"})
-
-
-@app.route("/delete_client/<hwid>", methods=["POST"])
-@login_required
-@csrf_protected
-def delete_client(hwid):
-    if not is_valid_hwid(hwid):
-        return jsonify({"error": "Invalid HWID"}), 400
-    with DB_LOCK:
-        if hwid in db_clienti:
-            removed = db_clienti.pop(hwid, None) or {}
-            save_db()
-            append_audit("device_deleted", hwid, removed.get("hostname", hwid), get_client_ip(), "Device removed from fleet console", "warn")
-            return jsonify({"status": "ok"})
-    return jsonify({"error": "Client not found"}), 404
-
-
-@app.route("/request_support/<hwid>", methods=["POST"])
-@login_required
-@csrf_protected
-def request_support(hwid):
-    if not is_valid_hwid(hwid):
-        return jsonify({"error": "Invalid HWID"}), 400
-    with DB_LOCK:
-        if hwid in db_clienti:
-            db_clienti[hwid]["pending_cmd"] = "start_support"
-            db_clienti[hwid]["support_state"] = "waiting"
-            save_db()
-            append_audit("support_requested", hwid, db_clienti[hwid].get("hostname", hwid), get_client_ip(), "Requested interactive RustDesk support session", "info")
-    return jsonify({"status": "ok"})
-
-
-@app.route("/stop_support/<hwid>", methods=["POST"])
-@login_required
-@csrf_protected
-def stop_support(hwid):
-    if not is_valid_hwid(hwid):
-        return jsonify({"error": "Invalid HWID"}), 400
-    with DB_LOCK:
-        if hwid in db_clienti:
-            db_clienti[hwid]["pending_cmd"] = "stop_support"
-            db_clienti[hwid]["support_state"] = "idle"
-            db_clienti[hwid]["rustdesk_id"] = "N/A"
-            db_clienti[hwid]["rustdesk_pw"] = "N/A"
-            save_db()
-            append_audit("support_stopped", hwid, db_clienti[hwid].get("hostname", hwid), get_client_ip(), "Terminated/reset remote support session", "info")
-    return jsonify({"status": "ok"})
-
-
-@app.route("/update_meta/<hwid>", methods=["POST"])
-@login_required
-@csrf_protected
-def update_meta(hwid):
-    if not is_valid_hwid(hwid):
-        return jsonify({"error": "Invalid HWID"}), 400
-    data = request.get_json(silent=True) or {}
-    client_name = str(data.get("client_name", ""))[:80].strip()
-    notes = str(data.get("notes", ""))[:500].strip()
-    with DB_LOCK:
-        if hwid not in db_clienti:
-            return jsonify({"error": "Client not found"}), 404
-        db_clienti[hwid]["client_name"] = client_name
-        db_clienti[hwid]["notes"] = notes
-        save_db()
-        append_audit("meta_updated", hwid, db_clienti[hwid].get("hostname", hwid), get_client_ip(), f"Updated client label to '{client_name or 'Unassigned'}'", "info")
-    return jsonify({"status": "ok"})
-
-
-@app.route("/allow_reenroll/<hwid>", methods=["POST"])
-@login_required
-@csrf_protected
-def allow_reenroll(hwid):
-    if not is_valid_hwid(hwid):
-        return jsonify({"error": "Invalid HWID"}), 400
-    with DB_LOCK:
-        if hwid not in db_clienti:
-            return jsonify({"error": "Client not found"}), 404
-        db_clienti[hwid]["allow_reenroll"] = True
-        save_db()
-        append_audit("reenroll_approved", hwid, db_clienti[hwid].get("hostname", hwid), get_client_ip(), "Approved one-time HWID re-enrollment", "warn")
-    return jsonify({"status": "ok"})
-
-
-@app.route("/device_cmd/<hwid>", methods=["POST"])
-@login_required
-@csrf_protected
-def device_cmd(hwid):
-    if not is_valid_hwid(hwid):
-        return jsonify({"error": "Invalid HWID"}), 400
-    data = request.get_json(silent=True) or {}
-    cmd = str(data.get("cmd", "")).strip()
-    if cmd not in ALLOWED_REMOTE_CMDS:
-        return jsonify({"error": "Unsupported command"}), 400
-    with DB_LOCK:
-        if hwid not in db_clienti:
-            return jsonify({"error": "Client not found"}), 404
-        db_clienti[hwid]["pending_cmd"] = cmd
-        save_db()
-        append_audit("remote_command", hwid, db_clienti[hwid].get("hostname", hwid), get_client_ip(), f"Queued remote OS command: {cmd}", "info")
-    return jsonify({"status": "ok"})
-
-
-@app.route("/toggle_revoke/<hwid>", methods=["POST"])
-@login_required
-@csrf_protected
-def toggle_revoke(hwid):
-    if not is_valid_hwid(hwid):
-        return jsonify({"error": "Invalid HWID"}), 400
-    with DB_LOCK:
-        if hwid not in db_clienti:
-            return jsonify({"error": "Client not found"}), 404
-        new_val = not bool(db_clienti[hwid].get("revoked", False))
-        db_clienti[hwid]["revoked"] = new_val
-        save_db()
-        append_audit(
-            "device_revoked" if new_val else "device_restored",
-            hwid,
-            db_clienti[hwid].get("hostname", hwid),
-            get_client_ip(),
-            "Device access revoked by operator" if new_val else "Device access restored by operator",
-            "critical" if new_val else "ok",
-        )
-    return jsonify({"status": "ok", "revoked": new_val})
-
-
-@app.route("/clear_yara_alerts", methods=["POST"])
-@login_required
-@csrf_protected
-def clear_yara_alerts():
-    with DB_LOCK:
-        yara_alerts.clear()
-        atomic_write_json(YARA_FILE, yara_alerts)
-        append_audit("yara_cleared", "CONSOLE", "Operator", get_client_ip(), "Cleared all YARA threat alerts", "info")
-    return jsonify({"status": "ok"})
 
 
 @app.route("/api/client/submit_credentials", methods=["POST"])
@@ -721,12 +1328,34 @@ def submit_credentials():
                 db_clienti[hwid]["rustdesk_id"] = data.get("rustdesk_id")
                 db_clienti[hwid]["rustdesk_pw"] = data.get("rustdesk_pw")
                 db_clienti[hwid]["support_state"] = "approved"
-                append_audit("support_approved", hwid, hostname, get_client_ip(), "User approved remote support credentials", "ok")
+                append_audit(
+                    "support_approved",
+                    hwid,
+                    hostname,
+                    get_client_ip(),
+                    "Local user approved remote support credentials",
+                    "ok",
+                    category="support",
+                    actor="DEVICE",
+                    actor_name=hostname,
+                    actor_role="device",
+                )
             else:
                 db_clienti[hwid]["support_state"] = "rejected"
                 db_clienti[hwid]["rustdesk_id"] = "Rejected"
                 db_clienti[hwid]["rustdesk_pw"] = "N/A"
-                append_audit("support_rejected", hwid, hostname, get_client_ip(), "User declined remote support request", "warn")
+                append_audit(
+                    "support_rejected",
+                    hwid,
+                    hostname,
+                    get_client_ip(),
+                    "Local user declined remote support prompt",
+                    "warn",
+                    category="support",
+                    actor="DEVICE",
+                    actor_name=hostname,
+                    actor_role="device",
+                )
 
             save_db()
             return jsonify({"status": "ok"}), 200
@@ -754,7 +1383,18 @@ def client_yara_alert():
         hostname = db_clienti.get(hwid, {}).get("hostname", hwid)
 
         append_yara_alert(hwid, filename, rule, path, quarantine_path)
-        append_audit("yara_threat", hwid, hostname, get_client_ip(), f"YARA blocked '{filename}' (rule: {rule})", "critical")
+        append_audit(
+            "yara_threat",
+            hwid,
+            hostname,
+            get_client_ip(),
+            f"YARA quarantined '{filename}' (matched rule: {rule})",
+            "critical",
+            category="yara",
+            actor="DEVICE",
+            actor_name=hostname,
+            actor_role="device",
+        )
 
     return jsonify({"status": "recorded"}), 200
 
@@ -794,9 +1434,31 @@ def report_status():
             pending_reinstate = False
 
         if prev_status and prev_status != status and status != "Integru":
-            append_audit("tamper_detected", hwid, hostname, client_ip, "System integrity status changed to Modified", "critical")
+            append_audit(
+                "tamper_detected",
+                hwid,
+                hostname,
+                client_ip,
+                "System integrity status changed to Modified",
+                "critical",
+                category="security",
+                actor="DEVICE",
+                actor_name=hostname,
+                actor_role="device",
+            )
         elif prev_status and prev_status != "Integru" and status == "Integru":
-            append_audit("status_restored", hwid, hostname, client_ip, "System integrity verified as Intact", "ok")
+            append_audit(
+                "status_restored",
+                hwid,
+                hostname,
+                client_ip,
+                "System integrity verified as Intact",
+                "ok",
+                category="security",
+                actor="DEVICE",
+                actor_name=hostname,
+                actor_role="device",
+            )
 
         os_version = str(data.get("os_version") or current_client.get("os_version", ""))[:64]
         update_channel = str(data.get("update_channel") or current_client.get("update_channel", "stable"))[:24]

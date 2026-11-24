@@ -10,7 +10,10 @@
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="{{ url_for('static', filename='console.css') }}">
 </head>
-<body class="console-page">
+<body class="console-page"
+      data-username="{{ current_user.username }}"
+      data-display-name="{{ current_user.display_name }}"
+      data-role="{{ current_user.role }}">
   <canvas id="sl-mesh"></canvas>
 
   <div class="shell">
@@ -34,77 +37,227 @@
           <span class="val" id="supportKeyVal">{{ support_key }}</span>
           <button class="btn-mini-copy" type="button" id="copyKeyBtn">Copy</button>
         </div>
-        <button class="btn-chip" type="button" id="openThreatsBtn">
-          Threat Alerts
-          <span class="count-pill" id="threatsBadge">0</span>
-        </button>
-        <button class="btn-chip" type="button" id="openAuditBtn">Audit Log</button>
+        <div class="operator-pill">
+          <span>{{ current_user.display_name }}</span>
+          <span class="role-tag {{ current_user.role }}">{{ current_user.role }}</span>
+        </div>
         <a href="/logout" class="btn-chip danger">Logout</a>
       </div>
     </header>
 
-    <section class="kpi-grid">
-      <div class="kpi-card">
-        <div class="kpi-label">Registered MiniPCs</div>
-        <div class="kpi-value" id="stat-total">0</div>
-        <div class="kpi-sub">Enrolled hardware identities</div>
+    <nav class="nav-tabs" id="navTabs">
+      <button class="nav-tab active" data-view="fleet" type="button">Fleet Devices</button>
+      <button class="nav-tab" data-view="audit" type="button">Audit &amp; Accountability</button>
+      <button class="nav-tab" data-view="threats" type="button">
+        Threat Alerts
+        <span class="count-pill" id="threatsBadge">0</span>
+      </button>
+      {% if current_user.role == 'admin' %}
+      <button class="nav-tab" data-view="team" type="button">Support Team</button>
+      {% endif %}
+    </nav>
+
+    <!-- VIEW 1: FLEET DEVICES -->
+    <main class="view-panel" id="view-fleet">
+      <section class="kpi-grid">
+        <div class="kpi-card">
+          <div class="kpi-label">Registered MiniPCs</div>
+          <div class="kpi-value" id="stat-total">0</div>
+          <div class="kpi-sub">Enrolled hardware identities</div>
+        </div>
+        <div class="kpi-card online">
+          <div class="kpi-label">Online Now</div>
+          <div class="kpi-value" id="stat-online">0</div>
+          <div class="kpi-sub">Heartbeat within 30s</div>
+        </div>
+        <div class="kpi-card secure">
+          <div class="kpi-label">Integrity Intact</div>
+          <div class="kpi-value" id="stat-secure">0</div>
+          <div class="kpi-sub">SELinux + Lockdown active</div>
+        </div>
+        <div class="kpi-card updates">
+          <div class="kpi-label">Updates Pending</div>
+          <div class="kpi-value" id="stat-updates">0</div>
+          <div class="kpi-sub">Staged for next restart</div>
+        </div>
+        <div class="kpi-card alert">
+          <div class="kpi-label">Security &amp; YARA Alerts</div>
+          <div class="kpi-value" id="stat-alerts">0</div>
+          <div class="kpi-sub">Tamper seals + quarantined files</div>
+        </div>
+      </section>
+
+      <div class="toolbar">
+        <div class="search-wrap">
+          <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.3-4.3"></path>
+          </svg>
+          <input id="searchInput" type="search" placeholder="Search by client name, hostname, HWID, IP, OS build or notes...">
+        </div>
+        <div class="filter-pills" id="filterPills">
+          <button class="filter-pill active" data-filter="all" type="button">All</button>
+          <button class="filter-pill" data-filter="online" type="button">Online</button>
+          <button class="filter-pill" data-filter="offline" type="button">Offline</button>
+          <button class="filter-pill" data-filter="modified" type="button">Modified</button>
+          <button class="filter-pill" data-filter="pending_update" type="button">Update Pending</button>
+          <button class="filter-pill" data-filter="support" type="button">Support Active</button>
+          <button class="filter-pill" data-filter="revoked" type="button">Revoked</button>
+        </div>
       </div>
-      <div class="kpi-card online">
-        <div class="kpi-label">Online Now</div>
-        <div class="kpi-value" id="stat-online">0</div>
-        <div class="kpi-sub">Heartbeat within 30s</div>
+
+      <div class="table-shell">
+        <table>
+          <thead>
+            <tr>
+              <th>Presence</th>
+              <th>Client / Device</th>
+              <th>OS Build &amp; Updates</th>
+              <th>Health &amp; Security</th>
+              <th>Network &amp; Sync</th>
+              <th>Remote Support</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="clients-tbody"></tbody>
+        </table>
       </div>
-      <div class="kpi-card secure">
-        <div class="kpi-label">Integrity Intact</div>
-        <div class="kpi-value" id="stat-secure">0</div>
-        <div class="kpi-sub">SELinux + Lockdown active</div>
+    </main>
+
+    <!-- VIEW 2: AUDIT & ACCOUNTABILITY -->
+    <section class="view-panel hidden" id="view-audit">
+      <div class="audit-filter-bar">
+        <div class="search-wrap" style="max-width: 380px;">
+          <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.3-4.3"></path>
+          </svg>
+          <input id="auditSearch" type="search" placeholder="Search action, operator, HWID, IP, or justification...">
+        </div>
+        <select id="auditActorFilter" class="audit-select">
+          <option value="">All Operators &amp; Sources</option>
+        </select>
+        <select id="auditCategoryFilter" class="audit-select">
+          <option value="">All Categories</option>
+          <option value="support">Support Sessions</option>
+          <option value="security">Integrity &amp; Security</option>
+          <option value="access">Access &amp; Lifecycle</option>
+          <option value="updates">OS Updates &amp; Reboots</option>
+          <option value="yara">YARA Quarantine</option>
+          <option value="team">Team Management</option>
+          <option value="auth">Authentication</option>
+        </select>
+        <select id="auditSeverityFilter" class="audit-select">
+          <option value="">All Severities</option>
+          <option value="critical">Critical</option>
+          <option value="warn">Warning</option>
+          <option value="ok">Success</option>
+          <option value="info">Info</option>
+        </select>
+        <select id="auditDaysFilter" class="audit-select">
+          <option value="">All Time</option>
+          <option value="1">Last 24 Hours</option>
+          <option value="7">Last 7 Days</option>
+          <option value="30">Last 30 Days</option>
+        </select>
+        <button class="btn btn-ghost" type="button" id="auditClearBtn">Reset Filters</button>
+        <button class="btn btn-primary" type="button" id="auditExportBtn">Export CSV</button>
       </div>
-      <div class="kpi-card updates">
-        <div class="kpi-label">Updates Pending</div>
-        <div class="kpi-value" id="stat-updates">0</div>
-        <div class="kpi-sub">Staged for next restart</div>
+
+      <div id="auditHwidBanner" style="display:none; margin-bottom:12px;">
+        <span class="badge badge-indigo">
+          Filtered by Device HWID: <strong id="auditHwidLabel"></strong>
+          <button type="button" id="clearAuditHwidBtn" style="background:none;border:none;color:#fff;cursor:pointer;font-weight:700;margin-left:6px;">×</button>
+        </span>
       </div>
-      <div class="kpi-card alert">
-        <div class="kpi-label">Security &amp; YARA Alerts</div>
-        <div class="kpi-value" id="stat-alerts">0</div>
-        <div class="kpi-sub">Tamper seals + quarantined files</div>
+
+      <div class="table-shell">
+        <table>
+          <thead>
+            <tr>
+              <th>Timestamp</th>
+              <th>Operator &amp; Role</th>
+              <th>Category &amp; Action</th>
+              <th>Target Device</th>
+              <th>Details &amp; Justification</th>
+              <th>Source IP</th>
+            </tr>
+          </thead>
+          <tbody id="audit-tbody"></tbody>
+        </table>
       </div>
     </section>
 
-    <div class="toolbar">
-      <div class="search-wrap">
-        <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.3-4.3"></path>
-        </svg>
-        <input id="searchInput" type="search" placeholder="Search by client name, hostname, HWID, IP, OS build or notes...">
+    <!-- VIEW 3: THREAT ALERTS -->
+    <section class="view-panel hidden" id="view-threats">
+      <div class="toolbar">
+        <div>
+          <h2 style="font-family: 'Space Grotesk', sans-serif; font-size: 1.15rem;">YARA Endpoint Quarantine Feed</h2>
+          <p style="font-size: 0.82rem; color: var(--muted); margin-top: 3px;">Real-time threats quarantined by <code>sourceless-guard</code> across enrolled MiniPCs.</p>
+        </div>
+        {% if current_user.role == 'admin' %}
+        <button class="btn btn-danger" type="button" id="clearThreatsBtn">Clear All Threat Alerts</button>
+        {% endif %}
       </div>
-      <div class="filter-pills" id="filterPills">
-        <button class="filter-pill active" data-filter="all" type="button">All</button>
-        <button class="filter-pill" data-filter="online" type="button">Online</button>
-        <button class="filter-pill" data-filter="offline" type="button">Offline</button>
-        <button class="filter-pill" data-filter="modified" type="button">Modified</button>
-        <button class="filter-pill" data-filter="pending_update" type="button">Update Pending</button>
-        <button class="filter-pill" data-filter="support" type="button">Support Active</button>
-        <button class="filter-pill" data-filter="revoked" type="button">Revoked</button>
+      <div class="table-shell">
+        <table>
+          <thead>
+            <tr>
+              <th>Timestamp</th>
+              <th>Client / Device</th>
+              <th>Matched YARA Rule</th>
+              <th>Blocked Filename</th>
+              <th>Source Path &amp; Quarantine Vault</th>
+            </tr>
+          </thead>
+          <tbody id="threats-tbody"></tbody>
+        </table>
       </div>
-    </div>
+    </section>
 
-    <div class="table-shell">
-      <table>
-        <thead>
-          <tr>
-            <th>Presence</th>
-            <th>Client / Device</th>
-            <th>OS Build &amp; Updates</th>
-            <th>Health &amp; Security</th>
-            <th>Network &amp; Sync</th>
-            <th>Remote Support</th>
-            <th>Actions</th>
-          </tr>
-        </thead>
-        <tbody id="clients-tbody"></tbody>
-      </table>
-    </div>
+    <!-- VIEW 4: SUPPORT TEAM (ADMIN ONLY) -->
+    {% if current_user.role == 'admin' %}
+    <section class="view-panel hidden" id="view-team">
+      <div class="team-grid">
+        <div class="panel-card">
+          <h3>Add Operator Account</h3>
+          <div class="field-group">
+            <label for="newOpUser">Username</label>
+            <input id="newOpUser" type="text" maxlength="32" placeholder="e.g. alex.support">
+          </div>
+          <div class="field-group">
+            <label for="newOpName">Full Name</label>
+            <input id="newOpName" type="text" maxlength="64" placeholder="e.g. Alex Popescu">
+          </div>
+          <div class="field-group">
+            <label for="newOpRole">Role</label>
+            <select id="newOpRole" class="audit-select" style="width:100%;">
+              <option value="support">Support Operator (Remote Support, Updates, Reinstate)</option>
+              <option value="admin">Administrator (Full Access + Revoke, Delete, Team)</option>
+            </select>
+          </div>
+          <div class="field-group">
+            <label for="newOpPass">Initial Passphrase (min. 8 chars)</label>
+            <input id="newOpPass" type="password" placeholder="Strong operator passphrase">
+          </div>
+          <button class="btn btn-primary" type="button" id="addOperatorBtn" style="padding: 11px 16px; justify-content: center;">Create Operator Account</button>
+        </div>
+
+        <div class="table-shell">
+          <table>
+            <thead>
+              <tr>
+                <th>Operator</th>
+                <th>Role</th>
+                <th>Status</th>
+                <th>Last Login</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="team-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+    {% endif %}
   </div>
 
   <div class="drawer-backdrop" id="backdrop"></div>
@@ -117,6 +270,8 @@
     </div>
     <div class="drawer-body">
       <div class="meta-box" id="drawerMeta"></div>
+
+      <button class="btn btn-ghost" type="button" id="viewDeviceAuditBtn" style="justify-content: center;">View Device Audit History</button>
 
       <div>
         <div class="section-lbl">Remote OS &amp; Update Controls</div>
@@ -138,43 +293,33 @@
       </div>
       <button class="btn btn-primary" type="button" id="saveMetaBtn" style="padding: 11px 16px; justify-content: center;">Save Client Details</button>
 
+      {% if current_user.role == 'admin' %}
       <div style="border-top: 1px solid var(--border); padding-top: 14px; display: flex; flex-direction: column; gap: 9px;">
-        <div class="section-lbl" style="margin-bottom: 2px;">Access &amp; Enrollment Controls</div>
+        <div class="section-lbl" style="margin-bottom: 2px;">Administrator Controls</div>
         <button class="btn btn-warn" type="button" id="toggleRevokeBtn" style="justify-content: center;">Revoke Device Access</button>
         <button class="btn btn-ghost" type="button" id="reenrollBtn" style="justify-content: center;">Allow One-Time Re-Enrollment</button>
         <button class="btn btn-danger" type="button" id="drawerDeleteBtn" style="justify-content: center;">Delete Device Record</button>
       </div>
+      {% endif %}
     </div>
   </aside>
 
-  <!-- YARA Threat Alerts Drawer -->
-  <aside class="drawer" id="threatsDrawer" aria-hidden="true">
-    <div class="drawer-head">
-      <h2>YARA Threat Alerts</h2>
-      <div style="display: flex; gap: 8px;">
-        <button class="btn btn-ghost" type="button" id="clearThreatsBtn">Clear All</button>
-        <button class="btn-chip" type="button" id="closeThreatsDrawer">Close</button>
-      </div>
-    </div>
-    <div class="drawer-body" id="threatsList"></div>
-  </aside>
-
-  <!-- Audit Log Drawer -->
-  <aside class="drawer" id="auditDrawer" aria-hidden="true">
-    <div class="drawer-head">
-      <h2>Security &amp; Support Audit Log</h2>
-      <button class="btn-chip" type="button" id="closeAuditDrawer">Close</button>
-    </div>
-    <div class="drawer-body" id="auditList"></div>
-  </aside>
-
-  <!-- Custom Confirm Modal -->
+  <!-- Custom Justification & Confirm Modal -->
   <div class="modal" id="confirmModal" role="dialog" aria-modal="true">
     <h3 id="modalTitle">Confirm Action</h3>
     <p id="modalMsg"></p>
+    <div class="field-group" id="modalPasswordWrap" style="display:none; margin-bottom:12px;">
+      <label for="modalPasswordInput">New Passphrase (minimum 8 characters)</label>
+      <input id="modalPasswordInput" type="password" placeholder="Enter new passphrase">
+    </div>
+    <div class="field-group" id="modalReasonWrap">
+      <label for="modalReasonInput">Operator Justification (Recorded in Audit Log)</label>
+      <textarea id="modalReasonInput" rows="3" maxlength="400" placeholder="Explain why this action is being performed (e.g., ticket #, client request, hardware swap)..."></textarea>
+      <div class="char-hint" id="modalReasonHint">Minimum 6 characters required</div>
+    </div>
     <div class="modal-btns">
       <button class="btn btn-ghost" type="button" id="modalCancel">Cancel</button>
-      <button class="btn btn-danger" type="button" id="modalConfirm">Confirm</button>
+      <button class="btn btn-primary" type="button" id="modalConfirm">Confirm</button>
     </div>
   </div>
 

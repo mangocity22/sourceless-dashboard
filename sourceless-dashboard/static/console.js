@@ -1,15 +1,22 @@
 (function () {
   const csrfToken = document.querySelector('meta[name="csrf-token"]')?.getAttribute('content') || '';
+  const bodyEl = document.body;
+  const userRole = bodyEl?.getAttribute('data-role') || 'support';
+  const isAdmin = userRole === 'admin';
+
   let fleetData = {
     clienti: {},
     stats: { total: 0, online: 0, secure: 0, compromised: 0, pending_updates: 0, yara_alerts: 0 },
-    audit_log: [],
     yara_alerts: []
   };
+  let activeView = 'fleet';
   let activeFilter = 'all';
   let searchQuery = '';
+  let auditHwidFilter = '';
   let inspectedHwid = null;
-  let pendingModalAction = null;
+  let pendingModalCfg = null;
+  let auditDebounce = null;
+  let lastAuditKey = '';
   const rejectedTimers = {};
   const displayedCounters = { total: 0, online: 0, secure: 0, updates: 0, alerts: 0 };
 
@@ -23,11 +30,12 @@
       .replace(/'/g, '&#039;');
   }
 
-  function showToast(msg) {
+  function showToast(msg, isError) {
     const stack = document.getElementById('toastStack');
     if (!stack) return;
     const el = document.createElement('div');
     el.className = 'toast';
+    if (isError) el.style.borderColor = 'rgba(242, 84, 109, 0.55)';
     el.textContent = msg;
     stack.appendChild(el);
     setTimeout(() => {
@@ -35,7 +43,7 @@
       el.style.transform = 'translateY(8px)';
       el.style.transition = 'opacity 0.2s, transform 0.2s';
       setTimeout(() => el.remove(), 220);
-    }, 2600);
+    }, 2800);
   }
 
   async function copyText(text, label, btnEl) {
@@ -87,7 +95,7 @@
   }
 
   function formatUpdateBadge(info) {
-    const st = (info.update_status || 'unknown').toLowerCase();
+    const st = (info.update_status || '').toLowerCase();
     if (st === 'pending_restart') return '<span class="badge badge-waiting">Restart Pending</span>';
     if (st === 'downloading' || st === 'checking') return '<span class="badge badge-indigo"><span class="spin-ring"></span>Updating</span>';
     if (st === 'error') return '<span class="badge badge-alert">Update Error</span>';
@@ -108,32 +116,84 @@
       window.location.reload();
       return null;
     }
+    if (!res.ok) {
+      let errText = 'Action failed';
+      try {
+        const j = await res.json();
+        if (j && j.error) errText = j.error;
+      } catch (_) {}
+      showToast(errText, true);
+      return null;
+    }
     return res;
   }
 
-  function openConfirm(title, message, onConfirm) {
-    document.getElementById('modalTitle').textContent = title;
-    document.getElementById('modalMsg').textContent = message;
-    pendingModalAction = onConfirm;
+  function validateModalState() {
+    if (!pendingModalCfg) return;
+    const reasonEl = document.getElementById('modalReasonInput');
+    const hintEl = document.getElementById('modalReasonHint');
+    const pwEl = document.getElementById('modalPasswordInput');
+    const confirmBtn = document.getElementById('modalConfirm');
+
+    const reasonVal = (reasonEl.value || '').trim();
+    const needReason = pendingModalCfg.requireReason !== false;
+    const reasonOk = !needReason || reasonVal.length >= 6;
+    const needPw = !!pendingModalCfg.askPassword;
+    const pwOk = !needPw || (pwEl.value || '').length >= 8;
+
+    if (needReason) {
+      hintEl.textContent = reasonOk
+        ? `Justification ready (${reasonVal.length}/400 characters)`
+        : `Minimum 6 characters required (${reasonVal.length}/6)`;
+      hintEl.classList.toggle('ok', reasonOk);
+    }
+    confirmBtn.disabled = !(reasonOk && pwOk);
+  }
+
+  function openActionModal(cfg) {
+    pendingModalCfg = cfg;
+    document.getElementById('modalTitle').textContent = cfg.title || 'Confirm Action';
+    document.getElementById('modalMsg').textContent = cfg.message || '';
+    const reasonWrap = document.getElementById('modalReasonWrap');
+    const reasonInput = document.getElementById('modalReasonInput');
+    const pwWrap = document.getElementById('modalPasswordWrap');
+    const pwInput = document.getElementById('modalPasswordInput');
+    const confirmBtn = document.getElementById('modalConfirm');
+
+    reasonWrap.style.display = cfg.requireReason === false ? 'none' : 'block';
+    reasonInput.value = '';
+    reasonInput.placeholder = cfg.placeholder || 'Provide reason (ticket #, client request, incident reference)...';
+
+    pwWrap.style.display = cfg.askPassword ? 'block' : 'none';
+    pwInput.value = '';
+
+    confirmBtn.textContent = cfg.confirmLabel || 'Confirm';
+    confirmBtn.className = 'btn ' + (cfg.danger ? 'btn-danger' : 'btn-primary');
+
     document.getElementById('backdrop').classList.add('open');
     document.getElementById('confirmModal').classList.add('open');
+    validateModalState();
+    setTimeout(() => (cfg.askPassword ? pwInput : reasonInput).focus(), 60);
   }
 
   function closeAllOverlays() {
     document.getElementById('backdrop').classList.remove('open');
     document.getElementById('deviceDrawer').classList.remove('open');
-    document.getElementById('threatsDrawer').classList.remove('open');
-    document.getElementById('auditDrawer').classList.remove('open');
     document.getElementById('confirmModal').classList.remove('open');
-    pendingModalAction = null;
+    pendingModalCfg = null;
   }
 
-  function openDrawer(drawerId) {
-    document.getElementById('backdrop').classList.add('open');
-    ['deviceDrawer', 'threatsDrawer', 'auditDrawer'].forEach((id) => {
-      const el = document.getElementById(id);
-      if (el) el.classList.toggle('open', id === drawerId);
+  function switchView(viewName) {
+    activeView = viewName;
+    document.querySelectorAll('.nav-tab').forEach((t) => {
+      t.classList.toggle('active', t.getAttribute('data-view') === viewName);
     });
+    document.querySelectorAll('.view-panel').forEach((p) => {
+      p.classList.toggle('hidden', p.id !== 'view-' + viewName);
+    });
+    if (viewName === 'audit') fetchAuditLog();
+    if (viewName === 'threats') renderThreatsTable();
+    if (viewName === 'team' && isAdmin) fetchTeamMembers();
   }
 
   function openDeviceDrawer(hwid) {
@@ -144,7 +204,8 @@
     document.getElementById('metaClientName').value = info.client_name || '';
     document.getElementById('metaNotes').value = info.notes || '';
     renderDrawerMeta(hwid, info);
-    openDrawer('deviceDrawer');
+    document.getElementById('backdrop').classList.add('open');
+    document.getElementById('deviceDrawer').classList.add('open');
   }
 
   function renderDrawerMeta(hwid, info) {
@@ -170,43 +231,6 @@
     `;
   }
 
-  function renderAuditDrawer() {
-    const list = document.getElementById('auditList');
-    const items = fleetData.audit_log || [];
-    if (!items.length) {
-      list.innerHTML = '<div class="empty-state">No audit events recorded yet.</div>';
-      return;
-    }
-    list.innerHTML = items.map((ev) => `
-      <div class="audit-item sev-${escapeHtml(ev.severity || 'info')}">
-        <div class="audit-top">
-          <strong>${escapeHtml(ev.hostname || 'System')} • ${escapeHtml(ev.type || 'event')}</strong>
-          <span>${escapeHtml(ev.time || '')}</span>
-        </div>
-        <div class="audit-msg">${escapeHtml(ev.detail || '')}</div>
-      </div>
-    `).join('');
-  }
-
-  function renderThreatsDrawer() {
-    const list = document.getElementById('threatsList');
-    const items = fleetData.yara_alerts || [];
-    if (!items.length) {
-      list.innerHTML = '<div class="empty-state">No YARA threats detected across the fleet.</div>';
-      return;
-    }
-    list.innerHTML = items.map((al) => `
-      <div class="audit-item sev-critical">
-        <div class="audit-top">
-          <strong>${escapeHtml(al.client_label || al.hostname || al.hwid)}</strong>
-          <span>${escapeHtml(al.time || '')}</span>
-        </div>
-        <div class="audit-msg">Rule <strong>${escapeHtml(al.rule || 'Unknown')}</strong> quarantined <code>${escapeHtml(al.filename || 'file')}</code></div>
-        <div class="audit-sub">Source: ${escapeHtml(al.path || '—')}<br>Quarantine: ${escapeHtml(al.quarantine_path || '—')}</div>
-      </div>
-    `).join('');
-  }
-
   function matchesFilter(hwid, info) {
     if (activeFilter === 'online' && !info.online) return false;
     if (activeFilter === 'offline' && info.online) return false;
@@ -224,8 +248,9 @@
     return true;
   }
 
-  function renderTable() {
+  function renderFleetTable() {
     const tbody = document.getElementById('clients-tbody');
+    if (!tbody) return;
     const entries = Object.entries(fleetData.clienti || {});
     entries.sort((a, b) => {
       if (!!b[1].online !== !!a[1].online) return b[1].online ? 1 : -1;
@@ -251,13 +276,9 @@
         : '<span class="presence off"><span class="radar-dot"></span>Offline</span>';
 
       let statusHtml = '<span class="badge badge-secure">Intact</span>';
-      if (isRevoked) {
-        statusHtml = '<span class="badge badge-alert">Revoked</span>';
-      } else if (info.status === 'Inscris') {
-        statusHtml = '<span class="badge badge-muted">Enrolled</span>';
-      } else if (!isSecure) {
-        statusHtml = '<span class="badge badge-alert">Modified</span>';
-      }
+      if (isRevoked) statusHtml = '<span class="badge badge-alert">Revoked</span>';
+      else if (info.status === 'Inscris') statusHtml = '<span class="badge badge-muted">Enrolled</span>';
+      else if (!isSecure) statusHtml = '<span class="badge badge-alert">Modified</span>';
 
       const seOk = (info.selinux || '').toLowerCase() === 'enforcing';
       const ldOk = (info.lockdown || '').toLowerCase() === 'integrity' || (info.lockdown || '').toLowerCase() === 'confidentiality';
@@ -340,6 +361,155 @@
     }).join('');
   }
 
+  function renderThreatsTable() {
+    const tbody = document.getElementById('threats-tbody');
+    if (!tbody) return;
+    const items = fleetData.yara_alerts || [];
+    if (!items.length) {
+      tbody.innerHTML = '<tr><td colspan="5" class="empty-state">No YARA threats detected across the fleet.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = items.map((al) => `
+      <tr>
+        <td style="font-family:'JetBrains Mono',monospace;font-size:0.78rem;">${escapeHtml(al.time || '')}</td>
+        <td>
+          <div class="device-cell">
+            <span class="client-name">${escapeHtml(al.client_label || al.hostname || al.hwid)}</span>
+            <span class="host-sub">${escapeHtml(al.hwid || '')}</span>
+          </div>
+        </td>
+        <td><span class="badge badge-alert">${escapeHtml(al.rule || 'Unknown')}</span></td>
+        <td style="font-family:'JetBrains Mono',monospace;font-size:0.81rem;color:#fff;">${escapeHtml(al.filename || '')}</td>
+        <td style="font-family:'JetBrains Mono',monospace;font-size:0.75rem;color:var(--muted);">
+          <div>Src: ${escapeHtml(al.path || '—')}</div>
+          <div>Vault: ${escapeHtml(al.quarantine_path || '—')}</div>
+        </td>
+      </tr>
+    `).join('');
+  }
+
+  function buildAuditParams() {
+    const params = new URLSearchParams();
+    const q = document.getElementById('auditSearch')?.value.trim() || '';
+    const actor = document.getElementById('auditActorFilter')?.value || '';
+    const cat = document.getElementById('auditCategoryFilter')?.value || '';
+    const sev = document.getElementById('auditSeverityFilter')?.value || '';
+    const days = document.getElementById('auditDaysFilter')?.value || '';
+    if (q) params.set('q', q);
+    if (actor) params.set('actor', actor);
+    if (cat) params.set('category', cat);
+    if (sev) params.set('severity', sev);
+    if (days) params.set('days', days);
+    if (auditHwidFilter) params.set('hwid', auditHwidFilter);
+    return params;
+  }
+
+  async function fetchAuditLog() {
+    const banner = document.getElementById('auditHwidBanner');
+    const hwidLbl = document.getElementById('auditHwidLabel');
+    if (banner && hwidLbl) {
+      banner.style.display = auditHwidFilter ? 'block' : 'none';
+      hwidLbl.textContent = auditHwidFilter;
+    }
+    const params = buildAuditParams();
+    try {
+      const res = await fetch('/api/audit?' + params.toString(), { headers: { 'Accept': 'application/json' } });
+      if (res.status === 401) {
+        window.location.reload();
+        return;
+      }
+      const data = await res.json();
+      const actorSel = document.getElementById('auditActorFilter');
+      if (actorSel && Array.isArray(data.actors)) {
+        const cur = actorSel.value;
+        actorSel.innerHTML = '<option value="">All Operators &amp; Sources</option>' +
+          data.actors.map((a) => `<option value="${escapeHtml(a)}">${escapeHtml(a)}</option>`).join('');
+        actorSel.value = cur;
+      }
+      const tbody = document.getElementById('audit-tbody');
+      if (!tbody) return;
+      const entries = data.entries || [];
+      const curKey = JSON.stringify(entries);
+      if (curKey === lastAuditKey) return;
+      lastAuditKey = curKey;
+      if (!entries.length) {
+        tbody.innerHTML = '<tr><td colspan="6" class="empty-state">No audit records match the selected filters.</td></tr>';
+        return;
+      }
+      tbody.innerHTML = entries.map((ev) => {
+        const sev = ev.severity || 'info';
+        const sevClass = sev === 'critical' ? 'badge-alert' : (sev === 'ok' ? 'badge-secure' : (sev === 'warn' ? 'badge-waiting' : 'badge-muted'));
+        const role = (ev.actor_role || 'system').toLowerCase();
+        return `
+          <tr>
+            <td style="font-family:'JetBrains Mono',monospace;font-size:0.78rem;white-space:nowrap;">${escapeHtml(ev.time || '')}</td>
+            <td>
+              <div class="device-cell">
+                <span class="client-name">${escapeHtml(ev.actor_name || ev.actor)}</span>
+                <span class="mini-tags"><span class="role-tag ${escapeHtml(role)}">${escapeHtml(role)}</span> <span class="host-sub">${escapeHtml(ev.actor)}</span></span>
+              </div>
+            </td>
+            <td>
+              <div class="telemetry-stack">
+                <span class="badge ${sevClass}">${escapeHtml(ev.type || 'event')}</span>
+                <span class="host-sub">${escapeHtml(ev.category || 'system')}</span>
+              </div>
+            </td>
+            <td>
+              <div class="device-cell">
+                <span style="font-weight:600;">${escapeHtml(ev.client_label || ev.hostname || 'Console')}</span>
+                <span class="host-sub" style="font-family:'JetBrains Mono',monospace;">${escapeHtml(ev.hwid || '')}</span>
+              </div>
+            </td>
+            <td>
+              <div style="line-height:1.4;">${escapeHtml(ev.detail || '')}</div>
+              ${ev.reason ? `<div class="reason-box"><strong>Reason:</strong> ${escapeHtml(ev.reason)}</div>` : ''}
+            </td>
+            <td style="font-family:'JetBrains Mono',monospace;font-size:0.78rem;color:var(--muted);">${escapeHtml(ev.ip || '')}</td>
+          </tr>
+        `;
+      }).join('');
+    } catch (err) {
+      console.error('Failed to fetch audit log:', err);
+    }
+  }
+
+  async function fetchTeamMembers() {
+    if (!isAdmin) return;
+    const tbody = document.getElementById('team-tbody');
+    if (!tbody) return;
+    try {
+      const res = await fetch('/api/team', { headers: { 'Accept': 'application/json' } });
+      if (!res.ok) return;
+      const data = await res.json();
+      const members = data.members || [];
+      tbody.innerHTML = members.map((m) => `
+        <tr>
+          <td>
+            <div class="device-cell">
+              <span class="client-name">${escapeHtml(m.full_name || m.username)}</span>
+              <span class="host-sub" style="font-family:'JetBrains Mono',monospace;">@${escapeHtml(m.username)}</span>
+            </div>
+          </td>
+          <td><span class="role-tag ${escapeHtml(m.role)}">${escapeHtml(m.role)}</span></td>
+          <td>${m.active ? '<span class="badge badge-secure">Active</span>' : '<span class="badge badge-alert">Disabled</span>'}</td>
+          <td style="font-family:'JetBrains Mono',monospace;font-size:0.78rem;color:var(--muted);">${escapeHtml(m.last_login || 'Never')}</td>
+          <td>
+            <div class="actions-row">
+              ${m.protected ? '<span class="host-sub">Primary Env Admin</span>' : `
+                <button class="btn btn-warn" type="button" data-team-action="toggle" data-user="${escapeHtml(m.username)}">${m.active ? 'Disable' : 'Enable'}</button>
+                <button class="btn btn-ghost" type="button" data-team-action="reset_pw" data-user="${escapeHtml(m.username)}">Reset Password</button>
+                <button class="btn btn-danger" type="button" data-team-action="delete" data-user="${escapeHtml(m.username)}">Delete</button>
+              `}
+            </div>
+          </td>
+        </tr>
+      `).join('');
+    } catch (err) {
+      console.error('Failed to load team:', err);
+    }
+  }
+
   async function refreshDashboard() {
     try {
       const res = await fetch('/api/data', { headers: { 'Accept': 'application/json' } });
@@ -354,7 +524,7 @@
         if (info.support_state === 'rejected') {
           if (!rejectedTimers[hwid]) {
             rejectedTimers[hwid] = setTimeout(async () => {
-              await postAdmin('/stop_support/' + encodeURIComponent(hwid));
+              await postAdmin('/stop_support/' + encodeURIComponent(hwid), { reason: 'Auto-reset after 10s access denial' });
               delete rejectedTimers[hwid];
               refreshDashboard();
             }, 10000);
@@ -381,38 +551,31 @@
         badge.classList.toggle('has-alerts', yaraCount > 0);
       }
 
-      renderTable();
+      renderFleetTable();
+      if (activeView === 'threats') renderThreatsTable();
       if (inspectedHwid && data.clienti[inspectedHwid] && document.getElementById('deviceDrawer').classList.contains('open')) {
         renderDrawerMeta(inspectedHwid, data.clienti[inspectedHwid]);
-      }
-      if (document.getElementById('auditDrawer').classList.contains('open')) {
-        renderAuditDrawer();
-      }
-      if (document.getElementById('threatsDrawer').classList.contains('open')) {
-        renderThreatsDrawer();
       }
     } catch (err) {
       console.error('Telemetry refresh failed:', err);
     }
   }
 
+  // Navigation Tabs
+  document.getElementById('navTabs')?.addEventListener('click', (e) => {
+    const tab = e.target.closest('.nav-tab');
+    if (!tab) return;
+    switchView(tab.getAttribute('data-view') || 'fleet');
+  });
+
   document.getElementById('copyKeyBtn')?.addEventListener('click', (e) => {
     copyText(document.getElementById('supportKeyVal').textContent.trim(), 'Support Key', e.currentTarget);
   });
 
-  document.getElementById('openAuditBtn')?.addEventListener('click', () => {
-    renderAuditDrawer();
-    openDrawer('auditDrawer');
-  });
-
-  document.getElementById('openThreatsBtn')?.addEventListener('click', () => {
-    renderThreatsDrawer();
-    openDrawer('threatsDrawer');
-  });
-
+  // Fleet search & filter
   document.getElementById('searchInput')?.addEventListener('input', (e) => {
     searchQuery = e.target.value.trim().toLowerCase();
-    renderTable();
+    renderFleetTable();
   });
 
   document.getElementById('filterPills')?.addEventListener('click', (e) => {
@@ -421,9 +584,10 @@
     document.querySelectorAll('.filter-pill').forEach((p) => p.classList.remove('active'));
     pill.classList.add('active');
     activeFilter = pill.getAttribute('data-filter') || 'all';
-    renderTable();
+    renderFleetTable();
   });
 
+  // Fleet table actions
   document.getElementById('clients-tbody')?.addEventListener('click', async (e) => {
     const copyBtn = e.target.closest('[data-copy]');
     if (copyBtn) {
@@ -438,104 +602,282 @@
 
     if (action === 'inspect') {
       openDeviceDrawer(hwid);
-    } else if (action === 'reinstate' || action === 'request_support' || action === 'stop_support') {
-      await postAdmin('/' + action + '/' + encodeURIComponent(hwid));
-      showToast(action === 'reinstate' ? 'Tamper seal reinstated' : (action === 'request_support' ? 'Support prompt dispatched' : 'Support session stopped'));
+    } else if (action === 'reinstate') {
+      openActionModal({
+        title: 'Reinstate Tamper Seal',
+        message: `Clear integrity warning on ${hwid}? Explain what verified the system state.`,
+        confirmLabel: 'Reinstate Device',
+        onSubmit: async (reason) => {
+          const ok = await postAdmin('/reinstate/' + encodeURIComponent(hwid), { reason });
+          if (ok) { showToast('Tamper seal reinstated'); refreshDashboard(); }
+        }
+      });
+    } else if (action === 'request_support') {
+      openActionModal({
+        title: 'Request Remote Support Session',
+        message: `Send an authorization prompt to ${hwid}. State the support ticket or reason visible to your audit team.`,
+        confirmLabel: 'Send Request',
+        onSubmit: async (reason) => {
+          const ok = await postAdmin('/request_support/' + encodeURIComponent(hwid), { reason });
+          if (ok) { showToast('Support prompt dispatched'); refreshDashboard(); }
+        }
+      });
+    } else if (action === 'stop_support') {
+      await postAdmin('/stop_support/' + encodeURIComponent(hwid), { reason: 'Operator closed remote support session' });
+      showToast('Support session stopped');
       refreshDashboard();
     }
   });
 
-  async function sendDeviceCmd(cmd, toastText) {
+  // Device Drawer Controls
+  document.getElementById('viewDeviceAuditBtn')?.addEventListener('click', () => {
     if (!inspectedHwid) return;
-    const res = await postAdmin('/device_cmd/' + encodeURIComponent(inspectedHwid), { cmd });
-    if (res && res.ok) {
-      showToast(toastText);
-      refreshDashboard();
-    }
-  }
+    auditHwidFilter = inspectedHwid;
+    closeAllOverlays();
+    switchView('audit');
+  });
 
-  document.getElementById('cmdCheckUpdateBtn')?.addEventListener('click', () => sendDeviceCmd('check_update', 'Update check command queued'));
-  document.getElementById('cmdStableBtn')?.addEventListener('click', () => sendDeviceCmd('set_channel_stable', 'Switched device to Stable channel'));
-  document.getElementById('cmdTestingBtn')?.addEventListener('click', () => sendDeviceCmd('set_channel_testing', 'Switched device to Testing channel'));
+  document.getElementById('cmdCheckUpdateBtn')?.addEventListener('click', async () => {
+    if (!inspectedHwid) return;
+    const ok = await postAdmin('/device_cmd/' + encodeURIComponent(inspectedHwid), { cmd: 'check_update' });
+    if (ok) { showToast('Update check command queued'); refreshDashboard(); }
+  });
+
+  document.getElementById('cmdStableBtn')?.addEventListener('click', () => {
+    if (!inspectedHwid) return;
+    const target = inspectedHwid;
+    openActionModal({
+      title: 'Switch Device to Stable Channel',
+      message: `Move ${target} to the production :stable release stream.`,
+      confirmLabel: 'Switch to Stable',
+      onSubmit: async (reason) => {
+        const ok = await postAdmin('/device_cmd/' + encodeURIComponent(target), { cmd: 'set_channel_stable', reason });
+        if (ok) { showToast('Channel switch queued'); refreshDashboard(); }
+      }
+    });
+  });
+
+  document.getElementById('cmdTestingBtn')?.addEventListener('click', () => {
+    if (!inspectedHwid) return;
+    const target = inspectedHwid;
+    openActionModal({
+      title: 'Switch Device to Testing Channel',
+      message: `Move ${target} to pre-release :testing builds.`,
+      confirmLabel: 'Switch to Testing',
+      onSubmit: async (reason) => {
+        const ok = await postAdmin('/device_cmd/' + encodeURIComponent(target), { cmd: 'set_channel_testing', reason });
+        if (ok) { showToast('Channel switch queued'); refreshDashboard(); }
+      }
+    });
+  });
+
   document.getElementById('cmdRebootBtn')?.addEventListener('click', () => {
     if (!inspectedHwid) return;
-    openConfirm(
-      'Reboot Remote MiniPC?',
-      'Are you sure you want to reboot device ' + inspectedHwid + '? Any staged OS update will install automatically during restart.',
-      async () => sendDeviceCmd('reboot_device', 'Reboot command queued for next heartbeat')
-    );
-  });
-
-  document.getElementById('backdrop')?.addEventListener('click', closeAllOverlays);
-  document.getElementById('closeDeviceDrawer')?.addEventListener('click', closeAllOverlays);
-  document.getElementById('closeThreatsDrawer')?.addEventListener('click', closeAllOverlays);
-  document.getElementById('closeAuditDrawer')?.addEventListener('click', closeAllOverlays);
-  document.getElementById('modalCancel')?.addEventListener('click', closeAllOverlays);
-  document.getElementById('modalConfirm')?.addEventListener('click', async () => {
-    if (pendingModalAction) await pendingModalAction();
-    closeAllOverlays();
+    const target = inspectedHwid;
+    openActionModal({
+      title: 'Reboot Remote MiniPC',
+      message: `Queue immediate reboot on ${target}. Any staged OS update will install during restart.`,
+      confirmLabel: 'Queue Reboot',
+      danger: true,
+      onSubmit: async (reason) => {
+        const ok = await postAdmin('/device_cmd/' + encodeURIComponent(target), { cmd: 'reboot_device', reason });
+        if (ok) { showToast('Reboot command queued'); refreshDashboard(); }
+      }
+    });
   });
 
   document.getElementById('saveMetaBtn')?.addEventListener('click', async () => {
     if (!inspectedHwid) return;
     const clientName = document.getElementById('metaClientName').value.trim();
     const notes = document.getElementById('metaNotes').value.trim();
-    const res = await postAdmin('/update_meta/' + encodeURIComponent(inspectedHwid), { client_name: clientName, notes });
-    if (res && res.ok) {
-      showToast('Client details saved');
-      refreshDashboard();
-    }
+    const ok = await postAdmin('/update_meta/' + encodeURIComponent(inspectedHwid), { client_name: clientName, notes });
+    if (ok) { showToast('Client details saved'); refreshDashboard(); }
   });
 
-  document.getElementById('toggleRevokeBtn')?.addEventListener('click', async () => {
-    if (!inspectedHwid) return;
-    const res = await postAdmin('/toggle_revoke/' + encodeURIComponent(inspectedHwid));
-    if (res && res.ok) {
-      const payload = await res.json();
-      showToast(payload.revoked ? 'Device access revoked' : 'Device access restored');
-      refreshDashboard();
-    }
+  document.getElementById('toggleRevokeBtn')?.addEventListener('click', () => {
+    if (!inspectedHwid || !isAdmin) return;
+    const target = inspectedHwid;
+    const curRevoked = !!fleetData.clienti[target]?.revoked;
+    openActionModal({
+      title: curRevoked ? 'Restore Device Access' : 'Revoke Device Access',
+      message: curRevoked ? `Re-enable fleet trust for ${target}.` : `Mark ${target} as revoked and block support requests.`,
+      confirmLabel: curRevoked ? 'Restore Access' : 'Revoke Access',
+      danger: !curRevoked,
+      onSubmit: async (reason) => {
+        const res = await postAdmin('/toggle_revoke/' + encodeURIComponent(target), { reason });
+        if (res) {
+          const payload = await res.json();
+          showToast(payload.revoked ? 'Device access revoked' : 'Device access restored');
+          refreshDashboard();
+        }
+      }
+    });
   });
 
   document.getElementById('reenrollBtn')?.addEventListener('click', () => {
-    if (!inspectedHwid) return;
-    const targetHwid = inspectedHwid;
-    openConfirm(
-      'Approve One-Time Re-Enrollment?',
-      'This allows device ' + targetHwid + ' to re-register and receive a new certificate/token on its next boot or OS reinstall.',
-      async () => {
-        await postAdmin('/allow_reenroll/' + encodeURIComponent(targetHwid));
-        showToast('Re-enrollment approved for next device check-in');
-        refreshDashboard();
+    if (!inspectedHwid || !isAdmin) return;
+    const target = inspectedHwid;
+    openActionModal({
+      title: 'Approve One-Time Re-Enrollment',
+      message: `Allow ${target} to receive a new certificate and telemetry token on next check-in.`,
+      confirmLabel: 'Approve Re-Enrollment',
+      onSubmit: async (reason) => {
+        const ok = await postAdmin('/allow_reenroll/' + encodeURIComponent(target), { reason });
+        if (ok) { showToast('Re-enrollment approved'); refreshDashboard(); }
       }
-    );
+    });
   });
 
   document.getElementById('drawerDeleteBtn')?.addEventListener('click', () => {
-    if (!inspectedHwid) return;
-    const targetHwid = inspectedHwid;
-    openConfirm(
-      'Delete Device Record?',
-      'Remove HWID ' + targetHwid + ' from the fleet database? It will lose telemetry access until re-enrolled.',
-      async () => {
-        await postAdmin('/delete_client/' + encodeURIComponent(targetHwid));
-        inspectedHwid = null;
-        showToast('Device deleted');
-        refreshDashboard();
+    if (!inspectedHwid || !isAdmin) return;
+    const target = inspectedHwid;
+    openActionModal({
+      title: 'Delete Device Record',
+      message: `Permanently delete HWID ${target} from the fleet database.`,
+      confirmLabel: 'Delete Permanently',
+      danger: true,
+      onSubmit: async (reason) => {
+        const ok = await postAdmin('/delete_client/' + encodeURIComponent(target), { reason });
+        if (ok) {
+          inspectedHwid = null;
+          showToast('Device deleted');
+          refreshDashboard();
+        }
       }
-    );
+    });
   });
 
-  document.getElementById('clearThreatsBtn')?.addEventListener('click', async () => {
-    await postAdmin('/clear_yara_alerts');
-    showToast('Threat alerts cleared');
-    refreshDashboard();
+  // Threats view
+  document.getElementById('clearThreatsBtn')?.addEventListener('click', () => {
+    openActionModal({
+      title: 'Clear All Threat Alerts',
+      message: 'Remove all YARA alert notifications from the dashboard feed.',
+      confirmLabel: 'Clear Alerts',
+      danger: true,
+      onSubmit: async (reason) => {
+        const ok = await postAdmin('/clear_yara_alerts', { reason });
+        if (ok) { showToast('Threat alerts cleared'); refreshDashboard(); }
+      }
+    });
+  });
+
+  // Audit filter & export listeners
+  document.getElementById('auditSearch')?.addEventListener('input', () => {
+    clearTimeout(auditDebounce);
+    auditDebounce = setTimeout(fetchAuditLog, 200);
+  });
+  ['auditActorFilter', 'auditCategoryFilter', 'auditSeverityFilter', 'auditDaysFilter'].forEach((id) => {
+    document.getElementById(id)?.addEventListener('change', fetchAuditLog);
+  });
+  document.getElementById('clearAuditHwidBtn')?.addEventListener('click', () => {
+    auditHwidFilter = '';
+    fetchAuditLog();
+  });
+  document.getElementById('auditClearBtn')?.addEventListener('click', () => {
+    document.getElementById('auditSearch').value = '';
+    document.getElementById('auditActorFilter').value = '';
+    document.getElementById('auditCategoryFilter').value = '';
+    document.getElementById('auditSeverityFilter').value = '';
+    document.getElementById('auditDaysFilter').value = '';
+    auditHwidFilter = '';
+    fetchAuditLog();
+  });
+  document.getElementById('auditExportBtn')?.addEventListener('click', () => {
+    const params = buildAuditParams();
+    window.location.href = '/api/audit/export.csv?' + params.toString();
+  });
+
+  // Team management listeners
+  document.getElementById('addOperatorBtn')?.addEventListener('click', () => {
+    const username = document.getElementById('newOpUser').value.trim();
+    const fullName = document.getElementById('newOpName').value.trim();
+    const role = document.getElementById('newOpRole').value;
+    const password = document.getElementById('newOpPass').value;
+    if (!username || password.length < 8) {
+      showToast('Enter a valid username and an 8+ character passphrase', true);
+      return;
+    }
+    openActionModal({
+      title: 'Create Operator Account',
+      message: `Create '${username}' with '${role}' permissions.`,
+      confirmLabel: 'Create Operator',
+      onSubmit: async (reason) => {
+        const ok = await postAdmin('/api/team/add', { username, full_name: fullName, role, password, reason });
+        if (ok) {
+          document.getElementById('newOpUser').value = '';
+          document.getElementById('newOpName').value = '';
+          document.getElementById('newOpPass').value = '';
+          showToast('Operator account created');
+          fetchTeamMembers();
+        }
+      }
+    });
+  });
+
+  document.getElementById('team-tbody')?.addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-team-action]');
+    if (!btn) return;
+    const action = btn.getAttribute('data-team-action');
+    const targetUser = btn.getAttribute('data-user');
+    if (!targetUser) return;
+
+    if (action === 'toggle') {
+      openActionModal({
+        title: 'Toggle Operator Status',
+        message: `Enable or disable console access for @${targetUser}.`,
+        confirmLabel: 'Apply Change',
+        onSubmit: async (reason) => {
+          const ok = await postAdmin('/api/team/toggle/' + encodeURIComponent(targetUser), { reason });
+          if (ok) { showToast('Operator status updated'); fetchTeamMembers(); }
+        }
+      });
+    } else if (action === 'reset_pw') {
+      openActionModal({
+        title: `Reset Passphrase (@${targetUser})`,
+        message: `Set a new passphrase for operator @${targetUser}.`,
+        confirmLabel: 'Reset Passphrase',
+        askPassword: true,
+        onSubmit: async (reason, password) => {
+          const ok = await postAdmin('/api/team/reset_password/' + encodeURIComponent(targetUser), { password, reason });
+          if (ok) { showToast('Passphrase updated'); fetchTeamMembers(); }
+        }
+      });
+    } else if (action === 'delete') {
+      openActionModal({
+        title: 'Delete Operator Account',
+        message: `Permanently delete @${targetUser}. Historical audit log entries remain preserved.`,
+        confirmLabel: 'Delete Operator',
+        danger: true,
+        onSubmit: async (reason) => {
+          const ok = await postAdmin('/api/team/delete/' + encodeURIComponent(targetUser), { reason });
+          if (ok) { showToast('Operator deleted'); fetchTeamMembers(); }
+        }
+      });
+    }
+  });
+
+  // Modal & Backdrop wiring
+  document.getElementById('backdrop')?.addEventListener('click', closeAllOverlays);
+  document.getElementById('closeDeviceDrawer')?.addEventListener('click', closeAllOverlays);
+  document.getElementById('modalCancel')?.addEventListener('click', closeAllOverlays);
+  document.getElementById('modalReasonInput')?.addEventListener('input', validateModalState);
+  document.getElementById('modalPasswordInput')?.addEventListener('input', validateModalState);
+  document.getElementById('modalConfirm')?.addEventListener('click', async () => {
+    if (!pendingModalCfg) return;
+    const reason = (document.getElementById('modalReasonInput').value || '').trim();
+    const password = document.getElementById('modalPasswordInput').value || '';
+    const handler = pendingModalCfg.onSubmit;
+    closeAllOverlays();
+    if (handler) await handler(reason, password);
   });
 
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') closeAllOverlays();
   });
 
-  setInterval(refreshDashboard, 2000);
+  setInterval(() => {
+    refreshDashboard();
+    if (activeView === 'audit') fetchAuditLog();
+  }, 2000);
   refreshDashboard();
 })();
