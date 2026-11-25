@@ -5,18 +5,22 @@ from werkzeug.security import generate_password_hash, check_password_hash
 import csv
 import hashlib
 import io
-import json
 import os
 import re
 import secrets
 import subprocess
+import sys
 import tempfile
-import threading
 import time
 import uuid
 
 # --- ENVIRONMENT & SECRETS CONFIGURATION ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+
+from db import DashboardStore
+
 ENV_FILE = "/etc/sourceless-dashboard.env"
 
 
@@ -40,16 +44,26 @@ def get_cfg(key, default=None):
     return env_data.get(key) or os.environ.get(key) or default
 
 
+def get_bucharest_tz():
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo("Europe/Bucharest")
+    except ImportError:
+        return timezone(timedelta(hours=2))
+
+
+def get_local_time():
+    return datetime.now(get_bucharest_tz()).strftime("%Y-%m-%d %H:%M:%S")
+
+
 app = Flask(
     __name__,
     template_folder=os.path.join(BASE_DIR, "templates"),
     static_folder=os.path.join(BASE_DIR, "static"),
 )
 
-# Secret key comes from environment in production; falls back to an ephemeral runtime key
-app.secret_key = get_cfg("DASHBOARD_SECRET_KEY") or secrets.token_hex(32)
 ADMIN_USER = get_cfg("DASHBOARD_ADMIN_USER", "admin")
-ADMIN_PASSWORD_HASH = generate_password_hash(get_cfg("DASHBOARD_ADMIN_PASS", "Sourceless2026!"))
+ADMIN_PASS_RAW = get_cfg("DASHBOARD_ADMIN_PASS", "Sourceless2026!")
 LOGIN_GATE_ROUTE = get_cfg("LOGIN_GATE_ROUTE", "/auth-console-gate")
 CLIENT_SECRET = get_cfg("DASHBOARD_CLIENT_SECRET", "SourcelessClientAuth2026SecretKey!")
 SUPPORT_KEY_SALT = get_cfg("SUPPORT_KEY_SALT", "SourcelessSecretSalt2026")
@@ -80,6 +94,8 @@ ASSET_VERSION = compute_asset_version()
 @app.context_processor
 def inject_global_template_vars():
     return {"asset_version": ASSET_VERSION}
+
+
 CA_KEY = os.path.join(CA_DIR, "ca.key")
 CA_CRT = os.path.join(CA_DIR, "ca.crt")
 DB_FILE = os.path.join(DATA_DIR, "db_clienti.json")
@@ -89,8 +105,8 @@ USERS_FILE = os.path.join(DATA_DIR, "users.json")
 
 ONLINE_THRESHOLD_SECONDS = 30
 SUPPORT_WAITING_TIMEOUT_SECONDS = 180
-MAX_AUDIT_ENTRIES = 2000
-MAX_YARA_ENTRIES = 200
+MAX_AUDIT_ENTRIES = 100000
+MAX_YARA_ENTRIES = 2000
 
 ALLOWED_REMOTE_CMDS = {
     "check_update",
@@ -101,10 +117,18 @@ ALLOWED_REMOTE_CMDS = {
 REASON_REQUIRED_CMDS = {"reboot_device", "set_channel_stable", "set_channel_testing"}
 
 os.makedirs(CA_DIR, exist_ok=True)
-DB_LOCK = threading.RLock()
 HWID_REGEX = re.compile(r"^[a-zA-Z0-9\-]{16,64}$")
 USERNAME_REGEX = re.compile(r"^[a-zA-Z0-9_.-]{3,32}$")
 UPTIME_RE = re.compile(r"^(?:(\d+)d\s+)?(\d+)h\s+(\d+)m$")
+
+store = DashboardStore(DATA_DIR)
+store.migrate_legacy_json(
+    {"clients": DB_FILE, "audit": AUDIT_FILE, "yara": YARA_FILE, "users": USERS_FILE},
+    get_local_time(),
+)
+app.secret_key = get_cfg("DASHBOARD_SECRET_KEY") or store.get_or_create_secret(
+    "session_secret", lambda: secrets.token_hex(32)
+)
 
 SOURCELESS_LOGO_SVG = """
 <svg viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
@@ -134,50 +158,20 @@ def get_client_ip():
 
 
 # --- RATE LIMITING ---
-FAILED_ATTEMPTS = {}
 MAX_ATTEMPTS = 5
 LOCKOUT_TIME_SECONDS = 900
 
 
 def is_ip_blocked(ip):
-    with DB_LOCK:
-        now = time.time()
-        if ip in FAILED_ATTEMPTS:
-            data = FAILED_ATTEMPTS[ip]
-            if data.get("blocked_until", 0) > now:
-                return True
-            if data.get("blocked_until", 0) <= now and data.get("attempts", 0) >= MAX_ATTEMPTS:
-                FAILED_ATTEMPTS.pop(ip, None)
-        return False
+    return store.is_ip_blocked(ip, MAX_ATTEMPTS)
 
 
 def record_failed_attempt(ip):
-    with DB_LOCK:
-        now = time.time()
-        if ip not in FAILED_ATTEMPTS:
-            FAILED_ATTEMPTS[ip] = {"attempts": 1, "blocked_until": 0}
-        else:
-            FAILED_ATTEMPTS[ip]["attempts"] += 1
-            if FAILED_ATTEMPTS[ip]["attempts"] >= MAX_ATTEMPTS:
-                FAILED_ATTEMPTS[ip]["blocked_until"] = now + LOCKOUT_TIME_SECONDS
+    store.record_failed_attempt(ip, MAX_ATTEMPTS, LOCKOUT_TIME_SECONDS)
 
 
 def reset_failed_attempts(ip):
-    with DB_LOCK:
-        FAILED_ATTEMPTS.pop(ip, None)
-
-
-# --- TIME & ATOMIC JSON PERSISTENCE ---
-def get_bucharest_tz():
-    try:
-        from zoneinfo import ZoneInfo
-        return ZoneInfo("Europe/Bucharest")
-    except ImportError:
-        return timezone(timedelta(hours=2))
-
-
-def get_local_time():
-    return datetime.now(get_bucharest_tz()).strftime("%Y-%m-%d %H:%M:%S")
+    store.reset_failed_attempts(ip)
 
 
 def get_today_support_key():
@@ -185,76 +179,27 @@ def get_today_support_key():
     return hashlib.sha256(f"{today_date}-{SUPPORT_KEY_SALT}".encode("utf-8")).hexdigest()[:8]
 
 
-def atomic_write_json(filepath, data):
-    parent = os.path.dirname(filepath) or "."
-    os.makedirs(parent, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(prefix=".tmp_", suffix=".json", dir=parent)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, filepath)
-    except Exception:
-        try:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except OSError:
-            pass
-        raise
-
-
-def load_json_file(filepath, fallback):
-    if os.path.exists(filepath):
-        try:
-            with open(filepath, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return fallback
-    return fallback
-
-
-db_clienti = load_json_file(DB_FILE, {})
-audit_log = load_json_file(AUDIT_FILE, [])
-yara_alerts = load_json_file(YARA_FILE, [])
-users_db = load_json_file(USERS_FILE, {})
-
-if not isinstance(db_clienti, dict):
-    db_clienti = {}
-if not isinstance(audit_log, list):
-    audit_log = []
-if not isinstance(yara_alerts, list):
-    yara_alerts = []
-if not isinstance(users_db, dict):
-    users_db = {}
-
-
-def save_db():
-    with DB_LOCK:
-        atomic_write_json(DB_FILE, db_clienti)
-
-
-def save_users():
-    with DB_LOCK:
-        atomic_write_json(USERS_FILE, users_db)
-
-
 def seed_primary_admin():
     """Ensures the primary administrator from env always exists and matches env credentials."""
-    with DB_LOCK:
-        existing = users_db.get(ADMIN_USER, {})
-        users_db[ADMIN_USER] = {
-            "username": ADMIN_USER,
-            "full_name": existing.get("full_name", "Lead Administrator"),
-            "role": "admin",
-            "password_hash": ADMIN_PASSWORD_HASH,
-            "active": True,
-            "protected": True,
-            "created_at": existing.get("created_at", get_local_time()),
-            "created_by": "system",
-            "last_login": existing.get("last_login", ""),
-        }
-        save_users()
+    with store.write_tx():
+        existing = store.get_user(ADMIN_USER)
+        if existing and check_password_hash(existing.get("password_hash", ""), ADMIN_PASS_RAW):
+            pwd_hash = existing["password_hash"]
+        else:
+            pwd_hash = generate_password_hash(ADMIN_PASS_RAW)
+        store.upsert_user(
+            {
+                "username": ADMIN_USER,
+                "full_name": existing.get("full_name", "Lead Administrator") if existing else "Lead Administrator",
+                "role": "admin",
+                "password_hash": pwd_hash,
+                "active": True,
+                "protected": True,
+                "created_at": existing.get("created_at", get_local_time()) if existing else get_local_time(),
+                "created_by": "system",
+                "last_login": existing.get("last_login", "") if existing else "",
+            }
+        )
 
 
 seed_primary_admin()
@@ -283,51 +228,49 @@ def append_audit(
     actor_name=None,
     actor_role=None,
 ):
-    with DB_LOCK:
-        if actor is None:
-            actor, actor_name, actor_role = current_actor()
-        client_rec = db_clienti.get(hwid, {}) if hwid else {}
-        client_label = client_rec.get("client_name") or hostname or hwid or "System"
-        entry = {
-            "id": uuid.uuid4().hex[:10],
-            "time": get_local_time(),
-            "ts": round(time.time(), 2),
-            "actor": actor,
-            "actor_name": actor_name or actor,
-            "actor_role": actor_role or "system",
-            "category": category,
-            "type": event_type,
-            "severity": severity,
-            "hwid": hwid or "SYSTEM",
-            "hostname": hostname or "Console",
-            "client_label": client_label,
-            "ip": ip or "127.0.0.1",
-            "detail": detail,
-            "reason": (reason or "").strip(),
-        }
-        audit_log.insert(0, entry)
-        del audit_log[MAX_AUDIT_ENTRIES:]
-        atomic_write_json(AUDIT_FILE, audit_log)
+    if actor is None:
+        actor, actor_name, actor_role = current_actor()
+    client_rec = (
+        store.get_client(hwid)
+        if hwid and hwid not in ("CONSOLE", "TEAM", "SYSTEM")
+        else None
+    )
+    client_label = (client_rec or {}).get("client_name") or hostname or hwid or "System"
+    entry = {
+        "id": uuid.uuid4().hex[:10],
+        "time": get_local_time(),
+        "ts": round(time.time(), 2),
+        "actor": actor,
+        "actor_name": actor_name or actor,
+        "actor_role": actor_role or "system",
+        "category": category,
+        "type": event_type,
+        "severity": severity,
+        "hwid": hwid or "SYSTEM",
+        "hostname": hostname or "Console",
+        "client_label": client_label,
+        "ip": ip or "127.0.0.1",
+        "detail": detail,
+        "reason": (reason or "").strip(),
+    }
+    store.insert_audit(entry, trim=True, max_entries=MAX_AUDIT_ENTRIES)
 
 
 def append_yara_alert(hwid, filename, rule, path, quarantine_path):
-    with DB_LOCK:
-        client = db_clienti.get(hwid, {})
-        entry = {
-            "id": uuid.uuid4().hex[:10],
-            "time": get_local_time(),
-            "ts": round(time.time(), 2),
-            "hwid": hwid,
-            "hostname": client.get("hostname", "Unknown"),
-            "client_label": client.get("client_name") or client.get("hostname") or hwid,
-            "filename": filename,
-            "rule": rule,
-            "path": path,
-            "quarantine_path": quarantine_path,
-        }
-        yara_alerts.insert(0, entry)
-        del yara_alerts[MAX_YARA_ENTRIES:]
-        atomic_write_json(YARA_FILE, yara_alerts)
+    client = store.get_client(hwid) or {}
+    entry = {
+        "id": uuid.uuid4().hex[:10],
+        "time": get_local_time(),
+        "ts": round(time.time(), 2),
+        "hwid": hwid,
+        "hostname": client.get("hostname", "Unknown"),
+        "client_label": client.get("client_name") or client.get("hostname") or hwid,
+        "filename": filename,
+        "rule": rule,
+        "path": path,
+        "quarantine_path": quarantine_path,
+    }
+    store.insert_yara_alert(entry, max_entries=MAX_YARA_ENTRIES)
 
 
 def compute_last_seen_ts(info):
@@ -363,14 +306,24 @@ def parse_uptime_minutes(uptime_str):
     return (days * 1440) + (hours * 60) + mins
 
 
-def auto_close_support_session(client_dict, hwid, reason_text):
+def auto_close_support_session(client_dict, hwid, reason_text, persist=True):
     """Reset active or pending remote support state and record an audit entry."""
+    now_ts = time.time()
     client_dict["support_state"] = "idle"
     client_dict["rustdesk_id"] = "N/A"
     client_dict["rustdesk_pw"] = "N/A"
-    client_dict["support_updated_ts"] = time.time()
+    client_dict["support_updated_ts"] = now_ts
     if client_dict.get("pending_cmd") == "start_support":
         client_dict["pending_cmd"] = ""
+    if persist:
+        store.update_client_fields(
+            hwid,
+            support_state="idle",
+            rustdesk_id="N/A",
+            rustdesk_pw="N/A",
+            support_updated_ts=now_ts,
+            pending_cmd=client_dict.get("pending_cmd", ""),
+        )
     append_audit(
         "support_auto_closed",
         hwid,
@@ -396,78 +349,16 @@ def require_reason(data, min_len=6):
     return reason, None
 
 
-def normalize_audit_entry(raw):
-    ev = dict(raw)
-    ev.setdefault("actor", "SYSTEM")
-    ev.setdefault("actor_name", ev["actor"])
-    ev.setdefault("actor_role", "system")
-    ev.setdefault("category", "system")
-    ev.setdefault("reason", "")
-    ev.setdefault("client_label", ev.get("hostname") or ev.get("hwid") or "System")
-    return ev
-
-
 def filter_audit_entries(args):
-    q = (args.get("q") or "").strip().lower()
-    actor = (args.get("actor") or "").strip()
-    category = (args.get("category") or "").strip().lower()
-    severity = (args.get("severity") or "").strip().lower()
-    hwid_filter = (args.get("hwid") or "").strip()
-    days_raw = (args.get("days") or "").strip()
-    limit_raw = (args.get("limit") or "250").strip()
-
-    cutoff_ts = 0.0
-    if days_raw:
-        try:
-            days_val = float(days_raw)
-            if days_val > 0:
-                cutoff_ts = time.time() - (days_val * 86400.0)
-        except ValueError:
-            pass
-
-    try:
-        limit_val = max(1, min(2000, int(limit_raw)))
-    except ValueError:
-        limit_val = 250
-
-    results = []
-    actors_set = set()
-    with DB_LOCK:
-        for raw in audit_log:
-            ev = normalize_audit_entry(raw)
-            actors_set.add(ev["actor"])
-            if cutoff_ts > 0 and float(ev.get("ts") or 0) < cutoff_ts:
-                continue
-            if actor and ev["actor"] != actor:
-                continue
-            if category and ev["category"].lower() != category:
-                continue
-            if severity and ev["severity"].lower() != severity:
-                continue
-            if hwid_filter and ev.get("hwid") != hwid_filter:
-                continue
-            if q:
-                hay = " ".join(
-                    [
-                        str(ev.get("actor", "")),
-                        str(ev.get("actor_name", "")),
-                        str(ev.get("type", "")),
-                        str(ev.get("category", "")),
-                        str(ev.get("hwid", "")),
-                        str(ev.get("hostname", "")),
-                        str(ev.get("client_label", "")),
-                        str(ev.get("ip", "")),
-                        str(ev.get("detail", "")),
-                        str(ev.get("reason", "")),
-                    ]
-                ).lower()
-                if q not in hay:
-                    continue
-            results.append(ev)
-            if len(results) >= limit_val:
-                break
-
-    return results, sorted(actors_set)
+    return store.query_audit(
+        q=args.get("q") or "",
+        actor=args.get("actor") or "",
+        category=args.get("category") or "",
+        severity=args.get("severity") or "",
+        hwid=args.get("hwid") or "",
+        days_raw=args.get("days") or "",
+        limit=args.get("limit") or "250",
+    )
 
 
 def csv_safe_cell(val):
@@ -518,13 +409,12 @@ def login_required(f):
                 return jsonify({"error": "Session expired"}), 401
             return redirect(LOGIN_GATE_ROUTE)
         uname = session.get("username")
-        with DB_LOCK:
-            u = users_db.get(uname)
-            if not u or not u.get("active", True):
-                session.clear()
-                if request.path.startswith("/api/") or request.is_json or request.method == "POST":
-                    return jsonify({"error": "Operator account disabled"}), 401
-                return redirect(LOGIN_GATE_ROUTE)
+        u = store.get_user(uname)
+        if not u or not u.get("active", True):
+            session.clear()
+            if request.path.startswith("/api/") or request.is_json or request.method == "POST":
+                return jsonify({"error": "Operator account disabled"}), 401
+            return redirect(LOGIN_GATE_ROUTE)
         return f(*args, **kwargs)
 
     return decorated_function
@@ -598,16 +488,15 @@ def login():
         else:
             user_input = (request.form.get("username") or "").strip()
             pass_input = request.form.get("password") or ""
-            with DB_LOCK:
-                user_rec = users_db.get(user_input)
+            with store.write_tx():
+                user_rec = store.get_user(user_input)
                 valid_user = bool(
                     user_rec
                     and user_rec.get("active", True)
                     and check_password_hash(user_rec.get("password_hash", ""), pass_input)
                 )
                 if valid_user:
-                    user_rec["last_login"] = get_local_time()
-                    save_users()
+                    store.update_user_fields(user_rec["username"], last_login=get_local_time())
 
             if valid_user:
                 reset_failed_attempts(client_ip)
@@ -694,9 +583,9 @@ def api_data():
     secure_count = 0
     pending_updates = 0
 
-    with DB_LOCK:
-        db_dirty = False
-        for hwid, info in db_clienti.items():
+    with store.write_tx():
+        clients = store.list_clients()
+        for hwid, info in clients.items():
             seen_ts = compute_last_seen_ts(info)
             support_ts = float(info.get("support_updated_ts") or 0.0)
             s_state = info.get("support_state", "idle")
@@ -707,15 +596,15 @@ def api_data():
                     info,
                     hwid,
                     "Remote support session auto-closed (device went offline / shut down)",
+                    persist=True,
                 )
-                db_dirty = True
             elif s_state == "waiting" and support_ts > 0 and (now_ts - support_ts) > SUPPORT_WAITING_TIMEOUT_SECONDS:
                 auto_close_support_session(
                     info,
                     hwid,
                     "Pending remote support request expired (no response or device offline)",
+                    persist=True,
                 )
-                db_dirty = True
 
             is_online = seen_ts > 0 and (now_ts - seen_ts) <= ONLINE_THRESHOLD_SECONDS
             if is_online:
@@ -730,9 +619,6 @@ def api_data():
             sanitized["online"] = is_online
             public_clients[hwid] = sanitized
 
-        if db_dirty:
-            save_db()
-
         total = len(public_clients)
         stats = {
             "total": total,
@@ -740,9 +626,9 @@ def api_data():
             "secure": secure_count,
             "compromised": total - secure_count,
             "pending_updates": pending_updates,
-            "yara_alerts": len(yara_alerts),
+            "yara_alerts": store.count_yara_alerts(),
         }
-        recent_yara = list(yara_alerts[:60])
+        recent_yara = store.list_yara_alerts(60)
 
     return jsonify(
         {
@@ -769,7 +655,7 @@ def api_audit():
 @login_required
 def export_audit_csv():
     args = dict(request.args)
-    args["limit"] = "2000"
+    args["limit"] = "5000"
     entries, _ = filter_audit_entries(args)
 
     buf = io.StringIO()
@@ -834,21 +720,20 @@ def export_audit_csv():
 @login_required
 @admin_required
 def api_team():
-    with DB_LOCK:
-        members = []
-        for u in users_db.values():
-            members.append(
-                {
-                    "username": u.get("username"),
-                    "full_name": u.get("full_name", ""),
-                    "role": u.get("role", "support"),
-                    "active": bool(u.get("active", True)),
-                    "protected": bool(u.get("protected", False)),
-                    "created_at": u.get("created_at", ""),
-                    "created_by": u.get("created_by", ""),
-                    "last_login": u.get("last_login", ""),
-                }
-            )
+    members = []
+    for u in store.list_users():
+        members.append(
+            {
+                "username": u.get("username"),
+                "full_name": u.get("full_name", ""),
+                "role": u.get("role", "support"),
+                "active": bool(u.get("active", True)),
+                "protected": bool(u.get("protected", False)),
+                "created_at": u.get("created_at", ""),
+                "created_by": u.get("created_by", ""),
+                "last_login": u.get("last_login", ""),
+            }
+        )
     members.sort(key=lambda m: (0 if m["protected"] else 1, m["username"]))
     return jsonify({"members": members})
 
@@ -874,22 +759,23 @@ def api_team_add():
     if len(password) < 8:
         return jsonify({"error": "Password must be at least 8 characters long."}), 400
 
-    with DB_LOCK:
-        if username in users_db:
+    with store.write_tx():
+        if store.get_user(username):
             return jsonify({"error": "Username already exists."}), 409
         actor, _, _ = current_actor()
-        users_db[username] = {
-            "username": username,
-            "full_name": full_name or username,
-            "role": role,
-            "password_hash": generate_password_hash(password),
-            "active": True,
-            "protected": False,
-            "created_at": get_local_time(),
-            "created_by": actor,
-            "last_login": "",
-        }
-        save_users()
+        store.upsert_user(
+            {
+                "username": username,
+                "full_name": full_name or username,
+                "role": role,
+                "password_hash": generate_password_hash(password),
+                "active": True,
+                "protected": False,
+                "created_at": get_local_time(),
+                "created_by": actor,
+                "last_login": "",
+            }
+        )
         append_audit(
             "operator_created",
             "TEAM",
@@ -913,15 +799,14 @@ def api_team_toggle(target_user):
     if err:
         return err
 
-    with DB_LOCK:
-        rec = users_db.get(target_user)
+    with store.write_tx():
+        rec = store.get_user(target_user)
         if not rec:
             return jsonify({"error": "Operator not found."}), 404
         if rec.get("protected") or target_user == ADMIN_USER:
             return jsonify({"error": "Primary administrator account cannot be disabled."}), 400
         new_active = not bool(rec.get("active", True))
-        rec["active"] = new_active
-        save_users()
+        store.update_user_fields(target_user, active=new_active)
         append_audit(
             "operator_enabled" if new_active else "operator_disabled",
             "TEAM",
@@ -948,14 +833,13 @@ def api_team_reset_password(target_user):
     if len(new_password) < 8:
         return jsonify({"error": "Password must be at least 8 characters long."}), 400
 
-    with DB_LOCK:
-        rec = users_db.get(target_user)
+    with store.write_tx():
+        rec = store.get_user(target_user)
         if not rec:
             return jsonify({"error": "Operator not found."}), 404
         if rec.get("protected") or target_user == ADMIN_USER:
             return jsonify({"error": "Primary administrator password is managed via environment config."}), 400
-        rec["password_hash"] = generate_password_hash(new_password)
-        save_users()
+        store.update_user_fields(target_user, password_hash=generate_password_hash(new_password))
         append_audit(
             "operator_password_reset",
             "TEAM",
@@ -979,14 +863,13 @@ def api_team_delete(target_user):
     if err:
         return err
 
-    with DB_LOCK:
-        rec = users_db.get(target_user)
+    with store.write_tx():
+        rec = store.get_user(target_user)
         if not rec:
             return jsonify({"error": "Operator not found."}), 404
         if rec.get("protected") or target_user == ADMIN_USER or target_user == session.get("username"):
             return jsonify({"error": "Primary or active session administrator cannot be deleted."}), 400
-        users_db.pop(target_user, None)
-        save_users()
+        store.delete_user(target_user)
         append_audit(
             "operator_deleted",
             "TEAM",
@@ -1012,16 +895,15 @@ def reinstate_client(hwid):
     if err:
         return err
 
-    with DB_LOCK:
-        if hwid not in db_clienti:
+    with store.write_tx():
+        client = store.get_client(hwid)
+        if not client:
             return jsonify({"error": "Client not found"}), 404
-        db_clienti[hwid]["pending_reinstate"] = True
-        db_clienti[hwid]["status"] = "Integru"
-        save_db()
+        store.update_client_fields(hwid, pending_reinstate=True, status="Integru")
         append_audit(
             "tamper_reinstated",
             hwid,
-            db_clienti[hwid].get("hostname", hwid),
+            client.get("hostname", hwid),
             get_client_ip(),
             "Operator cleared tamper seal and reinstated device integrity",
             "warn",
@@ -1043,10 +925,9 @@ def delete_client(hwid):
     if err:
         return err
 
-    with DB_LOCK:
-        if hwid in db_clienti:
-            removed = db_clienti.pop(hwid, None) or {}
-            save_db()
+    with store.write_tx():
+        removed = store.delete_client(hwid)
+        if removed:
             append_audit(
                 "device_deleted",
                 hwid,
@@ -1072,17 +953,20 @@ def request_support(hwid):
     if err:
         return err
 
-    with DB_LOCK:
-        if hwid not in db_clienti:
+    with store.write_tx():
+        client = store.get_client(hwid)
+        if not client:
             return jsonify({"error": "Client not found"}), 404
-        db_clienti[hwid]["pending_cmd"] = "start_support"
-        db_clienti[hwid]["support_state"] = "waiting"
-        db_clienti[hwid]["support_updated_ts"] = time.time()
-        save_db()
+        store.update_client_fields(
+            hwid,
+            pending_cmd="start_support",
+            support_state="waiting",
+            support_updated_ts=time.time(),
+        )
         append_audit(
             "support_requested",
             hwid,
-            db_clienti[hwid].get("hostname", hwid),
+            client.get("hostname", hwid),
             get_client_ip(),
             "Dispatched interactive RustDesk support authorization prompt",
             "info",
@@ -1100,18 +984,21 @@ def stop_support(hwid):
         return jsonify({"error": "Invalid HWID"}), 400
     data = request.get_json(silent=True) or {}
     reason = str(data.get("reason", "")).strip()[:400]
-    with DB_LOCK:
-        if hwid in db_clienti:
-            db_clienti[hwid]["pending_cmd"] = "stop_support"
-            db_clienti[hwid]["support_state"] = "idle"
-            db_clienti[hwid]["rustdesk_id"] = "N/A"
-            db_clienti[hwid]["rustdesk_pw"] = "N/A"
-            db_clienti[hwid]["support_updated_ts"] = time.time()
-            save_db()
+    with store.write_tx():
+        client = store.get_client(hwid)
+        if client:
+            store.update_client_fields(
+                hwid,
+                pending_cmd="stop_support",
+                support_state="idle",
+                rustdesk_id="N/A",
+                rustdesk_pw="N/A",
+                support_updated_ts=time.time(),
+            )
             append_audit(
                 "support_stopped",
                 hwid,
-                db_clienti[hwid].get("hostname", hwid),
+                client.get("hostname", hwid),
                 get_client_ip(),
                 "Terminated or reset remote support session",
                 "info",
@@ -1130,16 +1017,15 @@ def update_meta(hwid):
     data = request.get_json(silent=True) or {}
     client_name = str(data.get("client_name", ""))[:80].strip()
     notes = str(data.get("notes", ""))[:500].strip()
-    with DB_LOCK:
-        if hwid not in db_clienti:
+    with store.write_tx():
+        client = store.get_client(hwid)
+        if not client:
             return jsonify({"error": "Client not found"}), 404
-        db_clienti[hwid]["client_name"] = client_name
-        db_clienti[hwid]["notes"] = notes
-        save_db()
+        store.update_client_fields(hwid, client_name=client_name, notes=notes)
         append_audit(
             "meta_updated",
             hwid,
-            db_clienti[hwid].get("hostname", hwid),
+            client.get("hostname", hwid),
             get_client_ip(),
             f"Updated device label to '{client_name or 'Unassigned'}'",
             "info",
@@ -1160,15 +1046,15 @@ def allow_reenroll(hwid):
     if err:
         return err
 
-    with DB_LOCK:
-        if hwid not in db_clienti:
+    with store.write_tx():
+        client = store.get_client(hwid)
+        if not client:
             return jsonify({"error": "Client not found"}), 404
-        db_clienti[hwid]["allow_reenroll"] = True
-        save_db()
+        store.update_client_fields(hwid, allow_reenroll=True)
         append_audit(
             "reenroll_approved",
             hwid,
-            db_clienti[hwid].get("hostname", hwid),
+            client.get("hostname", hwid),
             get_client_ip(),
             "Approved one-time HWID re-enrollment",
             "warn",
@@ -1195,21 +1081,22 @@ def device_cmd(hwid):
         if err:
             return err
 
-    with DB_LOCK:
-        if hwid not in db_clienti:
+    with store.write_tx():
+        client = store.get_client(hwid)
+        if not client:
             return jsonify({"error": "Client not found"}), 404
-        if cmd == "reboot_device" and db_clienti[hwid].get("support_state") in ("approved", "waiting"):
+        if cmd == "reboot_device" and client.get("support_state") in ("approved", "waiting"):
             auto_close_support_session(
-                db_clienti[hwid],
+                client,
                 hwid,
                 "Remote support session auto-closed (remote reboot initiated)",
+                persist=True,
             )
-        db_clienti[hwid]["pending_cmd"] = cmd
-        save_db()
+        store.update_client_fields(hwid, pending_cmd=cmd)
         append_audit(
             "remote_command",
             hwid,
-            db_clienti[hwid].get("hostname", hwid),
+            client.get("hostname", hwid),
             get_client_ip(),
             f"Queued remote command: {cmd}",
             "warn" if cmd in REASON_REQUIRED_CMDS else "info",
@@ -1231,16 +1118,16 @@ def toggle_revoke(hwid):
     if err:
         return err
 
-    with DB_LOCK:
-        if hwid not in db_clienti:
+    with store.write_tx():
+        client = store.get_client(hwid)
+        if not client:
             return jsonify({"error": "Client not found"}), 404
-        new_val = not bool(db_clienti[hwid].get("revoked", False))
-        db_clienti[hwid]["revoked"] = new_val
-        save_db()
+        new_val = not bool(client.get("revoked", False))
+        store.update_client_fields(hwid, revoked=new_val)
         append_audit(
             "device_revoked" if new_val else "device_restored",
             hwid,
-            db_clienti[hwid].get("hostname", hwid),
+            client.get("hostname", hwid),
             get_client_ip(),
             "Device access revoked by administrator" if new_val else "Device access restored by administrator",
             "critical" if new_val else "ok",
@@ -1260,10 +1147,8 @@ def clear_yara_alerts():
     if err:
         return err
 
-    with DB_LOCK:
-        count = len(yara_alerts)
-        yara_alerts.clear()
-        atomic_write_json(YARA_FILE, yara_alerts)
+    with store.write_tx():
+        count = store.clear_yara_alerts()
         append_audit(
             "yara_cleared",
             "CONSOLE",
@@ -1288,8 +1173,8 @@ def register():
     if not is_valid_hwid(hwid):
         return jsonify({"error": "Invalid or missing HWID"}), 400
 
-    with DB_LOCK:
-        existing = db_clienti.get(hwid)
+    with store.write_tx():
+        existing = store.get_client(hwid)
         if existing and existing.get("token") and not existing.get("allow_reenroll", False):
             provided_secret = request.headers.get("X-Sourceless-Secret", "")
             if not secrets.compare_digest(provided_secret, CLIENT_SECRET):
@@ -1347,35 +1232,39 @@ def register():
         except Exception:
             pass
 
-    with DB_LOCK:
-        prev = db_clienti.get(hwid, {})
-        db_clienti[hwid] = {
-            "hostname": prev.get("hostname", ""),
-            "client_name": prev.get("client_name", ""),
-            "notes": prev.get("notes", ""),
-            "ip": prev.get("ip", client_ip),
-            "status": prev.get("status", "Inscris"),
-            "support_state": "idle",
-            "pending_cmd": "none",
-            "pending_reinstate": False,
-            "rustdesk_id": "N/A",
-            "rustdesk_pw": "N/A",
-            "last_seen": prev.get("last_seen", get_local_time()),
-            "last_seen_ts": time.time(),
-            "allow_reenroll": False,
-            "revoked": prev.get("revoked", False),
-            "os_version": prev.get("os_version", ""),
-            "update_channel": prev.get("update_channel", "stable"),
-            "update_status": prev.get("update_status", ""),
-            "selinux": prev.get("selinux", ""),
-            "lockdown": prev.get("lockdown", ""),
-            "yara_active": prev.get("yara_active", True),
-            "ram_percent": prev.get("ram_percent"),
-            "disk_percent": prev.get("disk_percent"),
-            "uptime": prev.get("uptime", ""),
-            "token": device_token,
-        }
-        save_db()
+    with store.write_tx():
+        prev = store.get_client(hwid) or {}
+        store.upsert_client(
+            hwid,
+            {
+                "hostname": prev.get("hostname", ""),
+                "client_name": prev.get("client_name", ""),
+                "organization": prev.get("organization", ""),
+                "notes": prev.get("notes", ""),
+                "ip": prev.get("ip", client_ip),
+                "status": prev.get("status", "Inscris"),
+                "support_state": "idle",
+                "support_updated_ts": 0.0,
+                "pending_cmd": "none",
+                "pending_reinstate": False,
+                "rustdesk_id": "N/A",
+                "rustdesk_pw": "N/A",
+                "last_seen": prev.get("last_seen", get_local_time()),
+                "last_seen_ts": time.time(),
+                "allow_reenroll": False,
+                "revoked": prev.get("revoked", False),
+                "os_version": prev.get("os_version", ""),
+                "update_channel": prev.get("update_channel", "stable"),
+                "update_status": prev.get("update_status", ""),
+                "selinux": prev.get("selinux", ""),
+                "lockdown": prev.get("lockdown", ""),
+                "yara_active": prev.get("yara_active", True),
+                "ram_percent": prev.get("ram_percent"),
+                "disk_percent": prev.get("disk_percent"),
+                "uptime": prev.get("uptime", ""),
+                "token": device_token,
+            },
+        )
         append_audit(
             "device_enrolled",
             hwid,
@@ -1400,28 +1289,33 @@ def submit_credentials():
     if not is_valid_hwid(hwid):
         return jsonify({"error": "Invalid HWID"}), 400
 
-    with DB_LOCK:
-        expected_token = db_clienti.get(hwid, {}).get("token") if hwid else None
+    with store.write_tx():
+        client = store.get_client(hwid)
+        expected_token = client.get("token") if client else None
         if not expected_token or not secrets.compare_digest(request.headers.get("X-Sourceless-Token", ""), expected_token):
             return jsonify({"error": "Unauthorized"}), 401
 
-        if hwid in db_clienti:
-            current_state = db_clienti[hwid].get("support_state")
-            hostname = db_clienti[hwid].get("hostname", hwid)
+        if client:
+            current_state = client.get("support_state")
+            hostname = client.get("hostname", hwid)
             now_ts = time.time()
-            db_clienti[hwid]["last_seen"] = get_local_time()
-            db_clienti[hwid]["last_seen_ts"] = now_ts
-            db_clienti[hwid]["support_updated_ts"] = now_ts
+            fields = {
+                "last_seen": get_local_time(),
+                "last_seen_ts": now_ts,
+                "support_updated_ts": now_ts,
+            }
 
             if current_state != "waiting" and data.get("status") == "approved":
-                db_clienti[hwid]["pending_cmd"] = "stop_support"
-                db_clienti[hwid]["support_state"] = "idle"
-                db_clienti[hwid]["rustdesk_id"] = "N/A"
-                db_clienti[hwid]["rustdesk_pw"] = "N/A"
+                fields["pending_cmd"] = "stop_support"
+                fields["support_state"] = "idle"
+                fields["rustdesk_id"] = "N/A"
+                fields["rustdesk_pw"] = "N/A"
+                store.update_client_fields(hwid, **fields)
             elif data.get("status") == "approved":
-                db_clienti[hwid]["rustdesk_id"] = data.get("rustdesk_id")
-                db_clienti[hwid]["rustdesk_pw"] = data.get("rustdesk_pw")
-                db_clienti[hwid]["support_state"] = "approved"
+                fields["rustdesk_id"] = data.get("rustdesk_id") or "N/A"
+                fields["rustdesk_pw"] = data.get("rustdesk_pw") or "N/A"
+                fields["support_state"] = "approved"
+                store.update_client_fields(hwid, **fields)
                 append_audit(
                     "support_approved",
                     hwid,
@@ -1435,9 +1329,10 @@ def submit_credentials():
                     actor_role="device",
                 )
             else:
-                db_clienti[hwid]["support_state"] = "rejected"
-                db_clienti[hwid]["rustdesk_id"] = "Rejected"
-                db_clienti[hwid]["rustdesk_pw"] = "N/A"
+                fields["support_state"] = "rejected"
+                fields["rustdesk_id"] = "Rejected"
+                fields["rustdesk_pw"] = "N/A"
+                store.update_client_fields(hwid, **fields)
                 append_audit(
                     "support_rejected",
                     hwid,
@@ -1451,7 +1346,6 @@ def submit_credentials():
                     actor_role="device",
                 )
 
-            save_db()
             return jsonify({"status": "ok"}), 200
 
     return jsonify({"error": "Client not found"}), 404
@@ -1465,8 +1359,9 @@ def client_yara_alert():
     if not is_valid_hwid(hwid):
         return jsonify({"error": "Invalid HWID"}), 400
 
-    with DB_LOCK:
-        expected_token = db_clienti.get(hwid, {}).get("token") if hwid else None
+    with store.write_tx():
+        client = store.get_client(hwid)
+        expected_token = client.get("token") if client else None
         if not expected_token or not secrets.compare_digest(request.headers.get("X-Sourceless-Token", ""), expected_token):
             return jsonify({"error": "Unauthorized"}), 401
 
@@ -1474,7 +1369,7 @@ def client_yara_alert():
         rule = str(data.get("rule", "UnknownRule"))[:120]
         path = str(data.get("path", ""))[:300]
         quarantine_path = str(data.get("quarantine_path", ""))[:300]
-        hostname = db_clienti.get(hwid, {}).get("hostname", hwid)
+        hostname = client.get("hostname", hwid)
 
         append_yara_alert(hwid, filename, rule, path, quarantine_path)
         append_audit(
@@ -1504,8 +1399,9 @@ def report_status():
     if not is_valid_hwid(hwid):
         return jsonify({"error": "Invalid HWID"}), 400
 
-    with DB_LOCK:
-        expected_token = db_clienti.get(hwid, {}).get("token") if hwid else None
+    with store.write_tx():
+        current_client = store.get_client(hwid) or {}
+        expected_token = current_client.get("token") if hwid else None
         if not expected_token or not secrets.compare_digest(request.headers.get("X-Sourceless-Token", ""), expected_token):
             return jsonify({"error": "Unauthorized"}), 401
 
@@ -1514,7 +1410,6 @@ def report_status():
 
         command = "none"
         now_ts = time.time()
-        current_client = db_clienti.get(hwid, {})
         prev_status = current_client.get("status")
         prev_seen_ts = compute_last_seen_ts(current_client)
         prev_uptime = current_client.get("uptime", "")
@@ -1530,12 +1425,14 @@ def report_status():
                     current_client,
                     hwid,
                     "Remote support session auto-closed (device reboot detected)",
+                    persist=False,
                 )
             elif s_state == "approved" and prev_seen_ts > 0 and (now_ts - max(prev_seen_ts, support_ts)) > ONLINE_THRESHOLD_SECONDS:
                 auto_close_support_session(
                     current_client,
                     hwid,
                     "Remote support session auto-closed (device reconnected after offline period)",
+                    persist=False,
                 )
                 if not current_client.get("pending_cmd") and not current_client.get("pending_reinstate"):
                     current_client["pending_cmd"] = "stop_support"
@@ -1588,34 +1485,37 @@ def report_status():
         disk_pct = clamp_pct(data.get("disk_percent")) if data.get("disk_percent") is not None else current_client.get("disk_percent")
         yara_active = data.get("yara_active") if isinstance(data.get("yara_active"), bool) else current_client.get("yara_active", True)
 
-        db_clienti[hwid] = {
-            "hostname": hostname,
-            "client_name": current_client.get("client_name", ""),
-            "notes": current_client.get("notes", ""),
-            "ip": client_ip,
-            "status": status,
-            "last_seen": get_local_time(),
-            "last_seen_ts": now_ts,
-            "pending_reinstate": pending_reinstate,
-            "rustdesk_id": current_client.get("rustdesk_id", "N/A"),
-            "rustdesk_pw": current_client.get("rustdesk_pw", "N/A"),
-            "support_state": current_client.get("support_state", "idle"),
-            "support_updated_ts": current_client.get("support_updated_ts", 0.0),
-            "pending_cmd": current_client.get("pending_cmd", ""),
-            "allow_reenroll": current_client.get("allow_reenroll", False),
-            "revoked": current_client.get("revoked", False),
-            "os_version": os_version,
-            "update_channel": update_channel,
-            "update_status": update_status,
-            "selinux": selinux,
-            "lockdown": lockdown,
-            "yara_active": yara_active,
-            "ram_percent": ram_pct,
-            "disk_percent": disk_pct,
-            "uptime": uptime,
-            "token": expected_token,
-        }
-        save_db()
+        store.upsert_client(
+            hwid,
+            {
+                "hostname": hostname,
+                "client_name": current_client.get("client_name", ""),
+                "organization": current_client.get("organization", ""),
+                "notes": current_client.get("notes", ""),
+                "ip": client_ip,
+                "status": status,
+                "last_seen": get_local_time(),
+                "last_seen_ts": now_ts,
+                "pending_reinstate": pending_reinstate,
+                "rustdesk_id": current_client.get("rustdesk_id", "N/A"),
+                "rustdesk_pw": current_client.get("rustdesk_pw", "N/A"),
+                "support_state": current_client.get("support_state", "idle"),
+                "support_updated_ts": current_client.get("support_updated_ts", 0.0),
+                "pending_cmd": current_client.get("pending_cmd", ""),
+                "allow_reenroll": current_client.get("allow_reenroll", False),
+                "revoked": current_client.get("revoked", False),
+                "os_version": os_version,
+                "update_channel": update_channel,
+                "update_status": update_status,
+                "selinux": selinux,
+                "lockdown": lockdown,
+                "yara_active": yara_active,
+                "ram_percent": ram_pct,
+                "disk_percent": disk_pct,
+                "uptime": uptime,
+                "token": expected_token,
+            },
+        )
 
     return jsonify({"message": "Status received", "command": command}), 200
 
