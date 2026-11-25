@@ -147,6 +147,11 @@ def is_valid_hwid(hwid):
     return bool(hwid and isinstance(hwid, str) and HWID_REGEX.match(hwid))
 
 
+def is_live_iso_hostname(hostname):
+    hn = (hostname or "").strip().lower()
+    return hn.startswith("localhost-live") or hn in ("live-iso", "sourceless-live")
+
+
 def get_client_ip():
     cf_ip = request.headers.get("CF-Connecting-IP")
     if cf_ip:
@@ -614,12 +619,24 @@ def api_data():
             if info.get("update_status") == "pending_restart":
                 pending_updates += 1
 
+            is_live_iso = is_live_iso_hostname(info.get("hostname", ""))
             sanitized = {k: v for k, v in info.items() if k != "token"}
             sanitized["last_seen_ts"] = seen_ts
             sanitized["online"] = is_online
+            sanitized["is_live_iso"] = is_live_iso
             public_clients[hwid] = sanitized
 
         total = len(public_clients)
+        orgs = sorted(
+            {
+                (c.get("organization") or "").strip()
+                for c in public_clients.values()
+                if (c.get("organization") or "").strip()
+            }
+        )
+        offline_live_iso = sum(
+            1 for c in public_clients.values() if c["is_live_iso"] and not c["online"]
+        )
         stats = {
             "total": total,
             "online": online_count,
@@ -627,6 +644,7 @@ def api_data():
             "compromised": total - secure_count,
             "pending_updates": pending_updates,
             "yara_alerts": store.count_yara_alerts(),
+            "offline_live_iso": offline_live_iso,
         }
         recent_yara = store.list_yara_alerts(60)
 
@@ -634,6 +652,7 @@ def api_data():
         {
             "clienti": public_clients,
             "stats": stats,
+            "organizations": orgs,
             "yara_alerts": recent_yara,
             "current_user": {
                 "username": session.get("username", ADMIN_USER),
@@ -1016,22 +1035,120 @@ def update_meta(hwid):
         return jsonify({"error": "Invalid HWID"}), 400
     data = request.get_json(silent=True) or {}
     client_name = str(data.get("client_name", ""))[:80].strip()
+    organization = str(data.get("organization", ""))[:80].strip()
     notes = str(data.get("notes", ""))[:500].strip()
     with store.write_tx():
         client = store.get_client(hwid)
         if not client:
             return jsonify({"error": "Client not found"}), 404
-        store.update_client_fields(hwid, client_name=client_name, notes=notes)
+        store.update_client_fields(
+            hwid,
+            client_name=client_name,
+            organization=organization,
+            notes=notes,
+        )
         append_audit(
             "meta_updated",
             hwid,
             client.get("hostname", hwid),
             get_client_ip(),
-            f"Updated device label to '{client_name or 'Unassigned'}'",
+            f"Updated device metadata (label: '{client_name or 'Unassigned'}', org: '{organization or 'None'}')",
             "info",
             category="access",
         )
     return jsonify({"status": "ok"})
+
+
+@app.route("/api/bulk_cmd", methods=["POST"])
+@login_required
+@csrf_protected
+def api_bulk_cmd():
+    data = request.get_json(silent=True) or {}
+    cmd = str(data.get("cmd", "")).strip()
+    if cmd not in ALLOWED_REMOTE_CMDS:
+        return jsonify({"error": "Unsupported command"}), 400
+    raw_hwids = data.get("hwids")
+    if not isinstance(raw_hwids, list) or not raw_hwids or len(raw_hwids) > 200:
+        return jsonify({"error": "Select between 1 and 200 devices."}), 400
+
+    reason, err = require_reason(data)
+    if err:
+        return err
+
+    seen = set()
+    targets = []
+    for raw in raw_hwids:
+        if is_valid_hwid(raw) and raw not in seen:
+            seen.add(raw)
+            targets.append(raw)
+    if not targets:
+        return jsonify({"error": "No valid device HWIDs provided."}), 400
+
+    queued = 0
+    skipped = 0
+    client_ip = get_client_ip()
+    with store.write_tx():
+        for hwid in targets:
+            client = store.get_client(hwid)
+            if not client or client.get("revoked"):
+                skipped += 1
+                continue
+            if cmd == "reboot_device" and client.get("support_state") in ("approved", "waiting"):
+                auto_close_support_session(
+                    client,
+                    hwid,
+                    "Remote support session auto-closed (bulk remote reboot initiated)",
+                    persist=True,
+                )
+            store.update_client_fields(hwid, pending_cmd=cmd)
+            append_audit(
+                "bulk_remote_command",
+                hwid,
+                client.get("hostname", hwid),
+                client_ip,
+                f"Bulk remote command queued: {cmd}",
+                "warn" if cmd in REASON_REQUIRED_CMDS else "info",
+                category="updates",
+                reason=reason,
+            )
+            queued += 1
+
+    return jsonify({"status": "ok", "queued": queued, "skipped": skipped})
+
+
+@app.route("/api/cleanup_live_iso", methods=["POST"])
+@login_required
+@admin_required
+@csrf_protected
+def api_cleanup_live_iso():
+    data = request.get_json(silent=True) or {}
+    reason, err = require_reason(data)
+    if err:
+        return err
+
+    now_ts = time.time()
+    removed = 0
+    with store.write_tx():
+        clients = store.list_clients()
+        for hwid, info in clients.items():
+            if not is_live_iso_hostname(info.get("hostname", "")):
+                continue
+            seen_ts = compute_last_seen_ts(info)
+            is_online = seen_ts > 0 and (now_ts - seen_ts) <= ONLINE_THRESHOLD_SECONDS
+            if not is_online:
+                if store.delete_client(hwid):
+                    removed += 1
+        append_audit(
+            "live_iso_cleaned",
+            "CONSOLE",
+            "Console",
+            get_client_ip(),
+            f"Removed {removed} offline Live ISO device record(s)",
+            "info",
+            category="access",
+            reason=reason,
+        )
+    return jsonify({"status": "ok", "removed": removed})
 
 
 @app.route("/allow_reenroll/<hwid>", methods=["POST"])

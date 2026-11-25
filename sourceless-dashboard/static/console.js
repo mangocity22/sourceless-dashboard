@@ -11,14 +11,24 @@
   };
   let activeView = 'fleet';
   let activeFilter = 'all';
+  let activeOrgFilter = '';
   let searchQuery = '';
   let auditHwidFilter = '';
   let inspectedHwid = null;
   let pendingModalCfg = null;
   let auditDebounce = null;
   let lastAuditKey = '';
+  const selectedHwids = new Set();
   const rejectedTimers = {};
   const displayedCounters = { total: 0, online: 0, secure: 0, updates: 0, alerts: 0 };
+  let soundEnabled = localStorage.getItem('sl_sound_alerts') !== 'off';
+  let hasInitialLoad = false;
+  let prevSupportStates = {};
+  let prevStatuses = {};
+  let prevYaraCount = 0;
+  const baseDocTitle = document.title;
+  let titleFlashTimer = null;
+  let audioCtx = null;
 
   function escapeHtml(unsafe) {
     if (unsafe === null || unsafe === undefined) return '';
@@ -45,6 +55,60 @@
       setTimeout(() => el.remove(), 220);
     }, 2800);
   }
+
+  function updateSoundToggleBtn() {
+    const btn = document.getElementById('soundToggleBtn');
+    if (!btn) return;
+    btn.textContent = soundEnabled ? 'Alerts: On' : 'Alerts: Muted';
+    btn.classList.toggle('muted', !soundEnabled);
+  }
+
+  function playAlertTone(kind) {
+    if (!soundEnabled) return;
+    try {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return;
+      if (!audioCtx) audioCtx = new Ctx();
+      if (audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
+      const now = audioCtx.currentTime;
+      const notes = kind === 'alert' ? [440, 330] : [587.33, 880];
+      notes.forEach((freq, idx) => {
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.type = kind === 'alert' ? 'triangle' : 'sine';
+        osc.frequency.setValueAtTime(freq, now + idx * 0.13);
+        gain.gain.setValueAtTime(0.001, now + idx * 0.13);
+        gain.gain.exponentialRampToValueAtTime(kind === 'alert' ? 0.07 : 0.06, now + idx * 0.13 + 0.02);
+        gain.gain.exponentialRampToValueAtTime(0.001, now + idx * 0.13 + 0.18);
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start(now + idx * 0.13);
+        osc.stop(now + idx * 0.13 + 0.2);
+      });
+    } catch (_) { }
+  }
+
+  function stopTitleFlash() {
+    if (titleFlashTimer) {
+      clearInterval(titleFlashTimer);
+      titleFlashTimer = null;
+    }
+    document.title = baseDocTitle;
+  }
+
+  function flashTabTitle(label) {
+    stopTitleFlash();
+    let tick = 0;
+    document.title = label;
+    titleFlashTimer = setInterval(() => {
+      tick += 1;
+      document.title = tick % 2 === 1 ? baseDocTitle : label;
+      if (tick >= 16) stopTitleFlash();
+    }, 900);
+  }
+
+  window.addEventListener('focus', stopTitleFlash);
+  updateSoundToggleBtn();
 
   async function copyText(text, label, btnEl) {
     try {
@@ -198,14 +262,54 @@
     if (viewName === 'team' && isAdmin) fetchTeamMembers();
   }
 
+  async function fetchDeviceTimeline(hwid) {
+    const box = document.getElementById('drawerTimeline');
+    if (!box || !hwid) return;
+    box.innerHTML = '<div class="timeline-empty">Loading recent activity...</div>';
+    try {
+      const res = await fetch('/api/audit?hwid=' + encodeURIComponent(hwid) + '&limit=10', {
+        headers: { 'Accept': 'application/json' }
+      });
+      if (!res.ok) {
+        box.innerHTML = '<div class="timeline-empty">Unable to load device timeline.</div>';
+        return;
+      }
+      const data = await res.json();
+      const entries = data.entries || [];
+      if (!entries.length) {
+        box.innerHTML = '<div class="timeline-empty">No recent audit events recorded for this device.</div>';
+        return;
+      }
+      box.innerHTML = entries.map((ev) => {
+        const sev = (ev.severity || 'info').toLowerCase();
+        const sevCls = sev === 'critical' ? 'sev-critical' : (sev === 'ok' ? 'sev-ok' : (sev === 'warn' ? 'sev-warn' : ''));
+        return `
+          <div class="audit-item ${sevCls}">
+            <div class="audit-top">
+              <span><strong>${escapeHtml(ev.actor_name || ev.actor)}</strong> • ${escapeHtml(ev.type || 'event')}</span>
+              <span>${escapeHtml(ev.time || '')}</span>
+            </div>
+            <div class="audit-msg">${escapeHtml(ev.detail || '')}</div>
+            ${ev.reason ? `<div class="audit-sub">Reason: ${escapeHtml(ev.reason)}</div>` : ''}
+          </div>
+        `;
+      }).join('');
+    } catch (_) {
+      box.innerHTML = '<div class="timeline-empty">Unable to load device timeline.</div>';
+    }
+  }
+
   function openDeviceDrawer(hwid) {
     const info = fleetData.clienti[hwid];
     if (!info) return;
     inspectedHwid = hwid;
     document.getElementById('drawerTitle').textContent = info.client_name || info.hostname || hwid;
     document.getElementById('metaClientName').value = info.client_name || '';
+    const orgEl = document.getElementById('metaOrganization');
+    if (orgEl) orgEl.value = info.organization || '';
     document.getElementById('metaNotes').value = info.notes || '';
     renderDrawerMeta(hwid, info);
+    fetchDeviceTimeline(hwid);
     document.getElementById('backdrop').classList.add('open');
     document.getElementById('deviceDrawer').classList.add('open');
   }
@@ -222,6 +326,7 @@
     box.innerHTML = `
       <span class="mk">HWID</span><span class="mv">${escapeHtml(hwid)}</span>
       <span class="mk">Hostname</span><span class="mv">${escapeHtml(info.hostname || '—')}</span>
+      <span class="mk">Organization</span><span class="mv">${escapeHtml(info.organization || 'Unassigned')}</span>
       <span class="mk">IP Address</span><span class="mv">${escapeHtml(info.ip || '—')}</span>
       <span class="mk">Presence</span><span class="mv">${info.online ? 'Online' : 'Offline'} (${formatRelative(info.last_seen_ts)})</span>
       <span class="mk">OS Build</span><span class="mv">${escapeHtml(info.os_version || 'Legacy')} (${escapeHtml(info.update_channel || 'stable')})</span>
@@ -239,15 +344,36 @@
     if (activeFilter === 'modified' && info.status === 'Integru') return false;
     if (activeFilter === 'pending_update' && info.update_status !== 'pending_restart') return false;
     if (activeFilter === 'support' && info.support_state !== 'waiting' && info.support_state !== 'approved') return false;
+    if (activeFilter === 'live_iso' && !info.is_live_iso) return false;
     if (activeFilter === 'revoked' && !info.revoked) return false;
+    if (activeOrgFilter && (info.organization || '').trim() !== activeOrgFilter) return false;
     if (searchQuery) {
       const hay = [
-        hwid, info.client_name, info.hostname, info.ip, info.notes,
+        hwid, info.client_name, info.organization, info.hostname, info.ip, info.notes,
         info.status, info.os_version, info.update_channel, info.update_status
       ].filter(Boolean).join(' ').toLowerCase();
       if (!hay.includes(searchQuery)) return false;
     }
     return true;
+  }
+
+  function updateBulkBar(visibleHwids) {
+    const bar = document.getElementById('bulkBar');
+    const countEl = document.getElementById('bulkCount');
+    const selectAllEl = document.getElementById('selectAllFleet');
+    if (countEl) countEl.textContent = String(selectedHwids.size);
+    if (bar) bar.hidden = selectedHwids.size === 0;
+    if (selectAllEl) {
+      const list = visibleHwids || [];
+      if (!list.length) {
+        selectAllEl.checked = false;
+        selectAllEl.indeterminate = false;
+      } else {
+        const matched = list.filter((h) => selectedHwids.has(h)).length;
+        selectAllEl.checked = matched === list.length;
+        selectAllEl.indeterminate = matched > 0 && matched < list.length;
+      }
+    }
   }
 
   function renderFleetTable() {
@@ -263,8 +389,9 @@
     });
 
     const filtered = entries.filter(([hwid, info]) => matchesFilter(hwid, info));
+    updateBulkBar(filtered.map(([h]) => h));
     if (!filtered.length) {
-      tbody.innerHTML = `<tr><td colspan="7" class="empty-state">${entries.length ? 'No MiniPCs match the active search or filter.' : 'No enrolled SourceLess MiniPCs yet.'}</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="8" class="empty-state">${entries.length ? 'No MiniPCs match the active search or filter.' : 'No enrolled SourceLess MiniPCs yet.'}</td></tr>`;
       return;
     }
 
@@ -275,6 +402,8 @@
       const isSecure = !isRevoked && info.status === 'Integru';
       const displayName = info.client_name || info.hostname || 'Unassigned Device';
       const subHost = info.client_name && info.hostname ? info.hostname : (info.notes ? info.notes.slice(0, 38) : 'Standard Node');
+      const orgBadge = info.organization ? `<span class="micro-tag org-tag">${escapeHtml(info.organization)}</span>` : '';
+      const liveBadge = info.is_live_iso ? '<span class="micro-tag live-iso">Live ISO</span>' : '';
 
       const presenceHtml = isOnline
         ? '<span class="presence on"><span class="radar-dot"></span>Online</span>'
@@ -343,10 +472,12 @@
 
       return `
         <tr data-hwid="${safeHwid}">
+          <td class="col-check"><input type="checkbox" class="row-check" data-select-hwid="${safeHwid}" ${selectedHwids.has(hwid) ? 'checked' : ''} aria-label="Select ${escapeHtml(displayName)}"></td>
           <td>${presenceHtml}</td>
           <td>
             <div class="device-cell">
               <span class="client-name">${escapeHtml(displayName)}</span>
+              ${(orgBadge || liveBadge) ? `<span class="mini-tags">${orgBadge}${liveBadge}</span>` : ''}
               <span class="host-sub">${escapeHtml(subHost)}</span>
               <button class="hwid-btn" type="button" data-copy="${safeHwid}" data-label="HWID" title="Click to copy ${safeHwid}">
                 <span class="hwid-txt">${safeHwid}</span>
@@ -543,6 +674,66 @@
       const st = data.stats || {};
       const yaraCount = st.yara_alerts || 0;
       const totalAlerts = (st.compromised || 0) + yaraCount;
+      const clientsObj = data.clienti || {};
+
+      for (const hwid of Array.from(selectedHwids)) {
+        if (!clientsObj[hwid]) selectedHwids.delete(hwid);
+      }
+
+      const orgSel = document.getElementById('orgFilter');
+      const orgList = Array.isArray(data.organizations) ? data.organizations : [];
+      if (orgSel) {
+        const curOrg = orgSel.value;
+        orgSel.innerHTML = '<option value="">All Organizations</option>' +
+          orgList.map((o) => `<option value="${escapeHtml(o)}">${escapeHtml(o)}</option>`).join('');
+        if (orgList.includes(curOrg)) {
+          orgSel.value = curOrg;
+        } else if (activeOrgFilter) {
+          activeOrgFilter = '';
+          orgSel.value = '';
+        }
+      }
+      const dl = document.getElementById('orgDatalist');
+      if (dl) {
+        dl.innerHTML = orgList.map((o) => `<option value="${escapeHtml(o)}">`).join('');
+      }
+
+      const cleanupBtn = document.getElementById('cleanupLiveIsoBtn');
+      if (cleanupBtn) {
+        const offlineLive = st.offline_live_iso || 0;
+        cleanupBtn.hidden = offlineLive <= 0;
+        cleanupBtn.textContent = `Clean Offline Live ISOs (${offlineLive})`;
+      }
+
+      const nextSupportStates = {};
+      const nextStatuses = {};
+      for (const [hwid, info] of Object.entries(clientsObj)) {
+        nextSupportStates[hwid] = info.support_state || 'idle';
+        nextStatuses[hwid] = info.status || '';
+        if (hasInitialLoad) {
+          if (prevSupportStates[hwid] !== 'approved' && info.support_state === 'approved') {
+            const label = info.client_name || info.hostname || hwid;
+            playAlertTone('support');
+            showToast(`Remote support approved on ${label}`);
+            flashTabTitle(`Support Approved — ${baseDocTitle}`);
+          }
+          if (prevStatuses[hwid] === 'Integru' && info.status && info.status !== 'Integru') {
+            const label = info.client_name || info.hostname || hwid;
+            playAlertTone('alert');
+            showToast(`Integrity tamper alert on ${label}`, true);
+            flashTabTitle(`⚠ Security Alert — ${baseDocTitle}`);
+          }
+        }
+      }
+      if (hasInitialLoad && yaraCount > prevYaraCount) {
+        playAlertTone('alert');
+        showToast('New YARA threat quarantined!', true);
+        flashTabTitle(`⚠ YARA Alert — ${baseDocTitle}`);
+      }
+      prevSupportStates = nextSupportStates;
+      prevStatuses = nextStatuses;
+      prevYaraCount = yaraCount;
+      hasInitialLoad = true;
 
       animateCounter('stat-total', 'total', st.total || 0);
       animateCounter('stat-online', 'online', st.online || 0);
@@ -577,9 +768,21 @@
     copyText(document.getElementById('supportKeyVal').textContent.trim(), 'Support Key', e.currentTarget);
   });
 
+  document.getElementById('soundToggleBtn')?.addEventListener('click', () => {
+    soundEnabled = !soundEnabled;
+    localStorage.setItem('sl_sound_alerts', soundEnabled ? 'on' : 'off');
+    updateSoundToggleBtn();
+    if (soundEnabled) playAlertTone('support');
+  });
+
   // Fleet search & filter
   document.getElementById('searchInput')?.addEventListener('input', (e) => {
     searchQuery = e.target.value.trim().toLowerCase();
+    renderFleetTable();
+  });
+
+  document.getElementById('orgFilter')?.addEventListener('change', (e) => {
+    activeOrgFilter = e.target.value || '';
     renderFleetTable();
   });
 
@@ -590,6 +793,84 @@
     pill.classList.add('active');
     activeFilter = pill.getAttribute('data-filter') || 'all';
     renderFleetTable();
+  });
+
+  document.getElementById('cleanupLiveIsoBtn')?.addEventListener('click', () => {
+    if (!isAdmin) return;
+    openActionModal({
+      title: 'Clean Offline Live ISO Nodes',
+      message: 'Remove all offline temporary Live ISO boot records from the fleet table.',
+      confirmLabel: 'Remove Offline Live ISOs',
+      onSubmit: async (reason) => {
+        const res = await postAdmin('/api/cleanup_live_iso', { reason });
+        if (res) {
+          const payload = await res.json();
+          showToast(`Removed ${payload.removed || 0} offline Live ISO record(s)`);
+          refreshDashboard();
+        }
+      }
+    });
+  });
+
+  // Multi-select & Bulk Actions
+  document.getElementById('clients-tbody')?.addEventListener('change', (e) => {
+    const chk = e.target.closest('[data-select-hwid]');
+    if (!chk) return;
+    const hwid = chk.getAttribute('data-select-hwid');
+    if (!hwid) return;
+    if (chk.checked) selectedHwids.add(hwid);
+    else selectedHwids.delete(hwid);
+    const visible = Array.from(document.querySelectorAll('#clients-tbody [data-select-hwid]'))
+      .map((el) => el.getAttribute('data-select-hwid'));
+    updateBulkBar(visible);
+  });
+
+  document.getElementById('selectAllFleet')?.addEventListener('change', (e) => {
+    const checked = !!e.target.checked;
+    document.querySelectorAll('#clients-tbody [data-select-hwid]').forEach((chk) => {
+      const hwid = chk.getAttribute('data-select-hwid');
+      chk.checked = checked;
+      if (hwid) {
+        if (checked) selectedHwids.add(hwid);
+        else selectedHwids.delete(hwid);
+      }
+    });
+    const visible = Array.from(document.querySelectorAll('#clients-tbody [data-select-hwid]'))
+      .map((el) => el.getAttribute('data-select-hwid'));
+    updateBulkBar(visible);
+  });
+
+  document.getElementById('bulkClearBtn')?.addEventListener('click', () => {
+    selectedHwids.clear();
+    renderFleetTable();
+  });
+
+  document.getElementById('bulkBar')?.addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-bulk-cmd]');
+    if (!btn || !selectedHwids.size) return;
+    const cmd = btn.getAttribute('data-bulk-cmd');
+    const hwids = Array.from(selectedHwids);
+    const labels = {
+      check_update: 'Check for OS Updates',
+      set_channel_stable: 'Switch to Stable Channel',
+      set_channel_testing: 'Switch to Testing Channel',
+      reboot_device: 'Reboot Devices'
+    };
+    openActionModal({
+      title: `Bulk Action: ${labels[cmd] || cmd}`,
+      message: `Queue '${labels[cmd] || cmd}' across ${hwids.length} selected device(s). One justification entry will be logged per device.`,
+      confirmLabel: `Run on ${hwids.length} Device(s)`,
+      danger: cmd === 'reboot_device',
+      onSubmit: async (reason) => {
+        const res = await postAdmin('/api/bulk_cmd', { hwids, cmd, reason });
+        if (res) {
+          const payload = await res.json();
+          selectedHwids.clear();
+          showToast(`Queued on ${payload.queued || 0} device(s)` + (payload.skipped ? ` (${payload.skipped} skipped)` : ''));
+          refreshDashboard();
+        }
+      }
+    });
   });
 
   // Fleet table actions
@@ -645,7 +926,11 @@
   document.getElementById('cmdCheckUpdateBtn')?.addEventListener('click', async () => {
     if (!inspectedHwid) return;
     const ok = await postAdmin('/device_cmd/' + encodeURIComponent(inspectedHwid), { cmd: 'check_update' });
-    if (ok) { showToast('Update check command queued'); refreshDashboard(); }
+    if (ok) {
+      showToast('Update check command queued');
+      refreshDashboard();
+      fetchDeviceTimeline(inspectedHwid);
+    }
   });
 
   document.getElementById('cmdStableBtn')?.addEventListener('click', () => {
@@ -694,9 +979,18 @@
   document.getElementById('saveMetaBtn')?.addEventListener('click', async () => {
     if (!inspectedHwid) return;
     const clientName = document.getElementById('metaClientName').value.trim();
+    const organization = (document.getElementById('metaOrganization')?.value || '').trim();
     const notes = document.getElementById('metaNotes').value.trim();
-    const ok = await postAdmin('/update_meta/' + encodeURIComponent(inspectedHwid), { client_name: clientName, notes });
-    if (ok) { showToast('Client details saved'); refreshDashboard(); }
+    const ok = await postAdmin('/update_meta/' + encodeURIComponent(inspectedHwid), {
+      client_name: clientName,
+      organization,
+      notes
+    });
+    if (ok) {
+      showToast('Client details saved');
+      refreshDashboard();
+      fetchDeviceTimeline(inspectedHwid);
+    }
   });
 
   document.getElementById('toggleRevokeBtn')?.addEventListener('click', () => {

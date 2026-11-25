@@ -41,6 +41,7 @@
           <span>{{ current_user.display_name }}</span>
           <span class="role-tag {{ current_user.role }}">{{ current_user.role }}</span>
         </div>
+        <button class="btn-chip sound-toggle" type="button" id="soundToggleBtn" title="Toggle live alert sounds">Alerts: On</button>
         <a href="/logout" class="btn-chip danger">Logout</a>
       </div>
     </header>
@@ -92,8 +93,11 @@
           <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.3-4.3"></path>
           </svg>
-          <input id="searchInput" type="search" placeholder="Search by client name, hostname, HWID, IP, OS build or notes...">
+          <input id="searchInput" type="search" placeholder="Search by client name, organization, hostname, HWID, IP or notes...">
         </div>
+        <select id="orgFilter" class="audit-select" aria-label="Filter by organization">
+          <option value="">All Organizations</option>
+        </select>
         <div class="filter-pills" id="filterPills">
           <button class="filter-pill active" data-filter="all" type="button">All</button>
           <button class="filter-pill" data-filter="online" type="button">Online</button>
@@ -101,7 +105,22 @@
           <button class="filter-pill" data-filter="modified" type="button">Modified</button>
           <button class="filter-pill" data-filter="pending_update" type="button">Update Pending</button>
           <button class="filter-pill" data-filter="support" type="button">Support Active</button>
+          <button class="filter-pill" data-filter="live_iso" type="button">Live ISO</button>
           <button class="filter-pill" data-filter="revoked" type="button">Revoked</button>
+        </div>
+        {% if current_user.role == 'admin' %}
+        <button class="btn btn-warn" type="button" id="cleanupLiveIsoBtn" hidden>Clean Offline Live ISOs (0)</button>
+        {% endif %}
+      </div>
+
+      <div class="bulk-bar" id="bulkBar" hidden>
+        <span class="bulk-count"><strong id="bulkCount">0</strong> device(s) selected</span>
+        <div class="actions-row">
+          <button class="btn btn-primary" type="button" data-bulk-cmd="check_update">Check Updates</button>
+          <button class="btn btn-ghost" type="button" data-bulk-cmd="set_channel_stable">Switch to Stable</button>
+          <button class="btn btn-ghost" type="button" data-bulk-cmd="set_channel_testing">Switch to Testing</button>
+          <button class="btn btn-danger" type="button" data-bulk-cmd="reboot_device">Reboot Selected</button>
+          <button class="btn btn-ghost" type="button" id="bulkClearBtn">Clear Selection</button>
         </div>
       </div>
 
@@ -109,6 +128,7 @@
         <table>
           <thead>
             <tr>
+              <th class="col-check"><input type="checkbox" id="selectAllFleet" class="row-check" aria-label="Select all visible devices"></th>
               <th>Presence</th>
               <th>Client / Device</th>
               <th>OS Build &amp; Updates</th>
@@ -271,8 +291,6 @@
     <div class="drawer-body">
       <div class="meta-box" id="drawerMeta"></div>
 
-      <button class="btn btn-ghost" type="button" id="viewDeviceAuditBtn" style="justify-content: center;">View Device Audit History</button>
-
       <div>
         <div class="section-lbl">Remote OS &amp; Update Controls</div>
         <div class="cmd-grid">
@@ -284,14 +302,27 @@
       </div>
 
       <div class="field-group">
-        <label for="metaClientName">Client / Company Name</label>
-        <input id="metaClientName" type="text" maxlength="80" placeholder="e.g. Clinic Alpha — Reception">
+        <label for="metaClientName">Client / Device Name</label>
+        <input id="metaClientName" type="text" maxlength="80" placeholder="e.g. Reception MiniPC #1">
+      </div>
+      <div class="field-group">
+        <label for="metaOrganization">Organization / Group</label>
+        <input id="metaOrganization" type="text" maxlength="80" list="orgDatalist" placeholder="e.g. Clinic Alpha, Bucharest HQ">
+        <datalist id="orgDatalist"></datalist>
       </div>
       <div class="field-group">
         <label for="metaNotes">Operator Notes</label>
         <textarea id="metaNotes" rows="3" maxlength="500" placeholder="Hardware location, warranty notes, deployed configuration..."></textarea>
       </div>
       <button class="btn btn-primary" type="button" id="saveMetaBtn" style="padding: 11px 16px; justify-content: center;">Save Client Details</button>
+
+      <div class="drawer-timeline-wrap">
+        <div class="drawer-timeline-head">
+          <div class="section-lbl" style="margin-bottom:0;">Recent Device Activity</div>
+          <button class="btn-link" type="button" id="viewDeviceAuditBtn">Full Audit Log →</button>
+        </div>
+        <div class="drawer-timeline" id="drawerTimeline"></div>
+      </div>
 
       {% if current_user.role == 'admin' %}
       <div style="border-top: 1px solid var(--border); padding-top: 14px; display: flex; flex-direction: column; gap: 9px;">
