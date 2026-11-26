@@ -11,6 +11,7 @@ import secrets
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 
@@ -107,6 +108,26 @@ ONLINE_THRESHOLD_SECONDS = 30
 SUPPORT_WAITING_TIMEOUT_SECONDS = 180
 MAX_AUDIT_ENTRIES = 100000
 MAX_YARA_ENTRIES = 2000
+ENROLL_BLOCKED_AUDIT_COOLDOWN_SECONDS = 300
+_enroll_blocked_lock = threading.Lock()
+_enroll_blocked_last_logged = {}
+
+
+def should_log_enroll_blocked(hwid, client_ip):
+    """Rate-limit repeated enroll_blocked audit entries per device/IP without altering 409 rejection."""
+    now = time.time()
+    key = (hwid, client_ip)
+    with _enroll_blocked_lock:
+        last_ts = _enroll_blocked_last_logged.get(key)
+        if last_ts is not None and (now - last_ts) < ENROLL_BLOCKED_AUDIT_COOLDOWN_SECONDS:
+            return False
+        if len(_enroll_blocked_last_logged) > 512:
+            cutoff = now - ENROLL_BLOCKED_AUDIT_COOLDOWN_SECONDS
+            stale_keys = [k for k, ts in _enroll_blocked_last_logged.items() if ts < cutoff]
+            for stale_key in stale_keys:
+                _enroll_blocked_last_logged.pop(stale_key, None)
+        _enroll_blocked_last_logged[key] = now
+        return True
 
 ALLOWED_REMOTE_CMDS = {
     "check_update",
@@ -1295,18 +1316,19 @@ def register():
         if existing and existing.get("token") and not existing.get("allow_reenroll", False):
             provided_secret = request.headers.get("X-Sourceless-Secret", "")
             if not secrets.compare_digest(provided_secret, CLIENT_SECRET):
-                append_audit(
-                    "enroll_blocked",
-                    hwid,
-                    existing.get("hostname", "Unknown"),
-                    client_ip,
-                    "Blocked unauthorized re-enrollment attempt on already registered HWID",
-                    "critical",
-                    category="security",
-                    actor="DEVICE",
-                    actor_name=existing.get("hostname", hwid),
-                    actor_role="device",
-                )
+                if should_log_enroll_blocked(hwid, client_ip):
+                    append_audit(
+                        "enroll_blocked",
+                        hwid,
+                        existing.get("hostname", "Unknown"),
+                        client_ip,
+                        "Blocked unauthorized re-enrollment attempt on already registered HWID",
+                        "critical",
+                        category="security",
+                        actor="DEVICE",
+                        actor_name=existing.get("hostname", hwid),
+                        actor_role="device",
+                    )
                 return jsonify({"error": "Device already enrolled. Admin re-enrollment approval required."}), 409
 
     device_token = str(uuid.uuid4())

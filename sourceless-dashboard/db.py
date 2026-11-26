@@ -101,49 +101,53 @@ class DashboardStore:
         os.makedirs(self.data_dir, exist_ok=True)
         self.db_path = os.path.join(self.data_dir, "sourceless.db")
         self._lock = threading.RLock()
-        self._local = threading.local()
+        self._shared_conn = None
+        self._tx_depth = 0
         self.init_schema()
 
     def _conn(self):
-        conn = getattr(self._local, "conn", None)
-        if conn is None:
-            conn = sqlite3.connect(
-                self.db_path,
-                timeout=15.0,
-                isolation_level=None,
-                check_same_thread=False,
-            )
-            conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA journal_mode=WAL;")
-            conn.execute("PRAGMA synchronous=NORMAL;")
-            conn.execute("PRAGMA busy_timeout=15000;")
-            conn.execute("PRAGMA temp_store=MEMORY;")
-            self._local.conn = conn
-            self._local.tx_depth = 0
-        return conn
+        with self._lock:
+            if self._shared_conn is None:
+                conn = sqlite3.connect(
+                    self.db_path,
+                    timeout=15.0,
+                    isolation_level=None,
+                    check_same_thread=False,
+                )
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA journal_mode=WAL;")
+                conn.execute("PRAGMA synchronous=NORMAL;")
+                conn.execute("PRAGMA busy_timeout=15000;")
+                conn.execute("PRAGMA cache_size=-4000;")
+                conn.execute("PRAGMA temp_store=MEMORY;")
+                self._shared_conn = conn
+                self._tx_depth = 0
+            return self._shared_conn
 
-    def close_thread_connection(self):
-        conn = getattr(self._local, "conn", None)
-        if conn is not None:
-            try:
-                conn.close()
-            except sqlite3.Error:
-                pass
-            self._local.conn = None
-            self._local.tx_depth = 0
+    def close(self):
+        with self._lock:
+            if self._shared_conn is not None:
+                try:
+                    self._shared_conn.close()
+                except sqlite3.Error:
+                    pass
+                self._shared_conn = None
+                self._tx_depth = 0
+
+    close_thread_connection = close
 
     @contextmanager
     def write_tx(self):
         with self._lock:
             conn = self._conn()
-            depth = getattr(self._local, "tx_depth", 0)
+            depth = self._tx_depth
             if depth == 0:
                 conn.execute("BEGIN IMMEDIATE;")
-            self._local.tx_depth = depth + 1
+            self._tx_depth = depth + 1
             try:
                 yield conn
             except BaseException:
-                self._local.tx_depth = depth
+                self._tx_depth = depth
                 if depth == 0 and conn.in_transaction:
                     try:
                         conn.execute("ROLLBACK;")
@@ -151,7 +155,7 @@ class DashboardStore:
                         pass
                 raise
             else:
-                self._local.tx_depth = depth
+                self._tx_depth = depth
                 if depth == 0 and conn.in_transaction:
                     conn.execute("COMMIT;")
 
@@ -656,8 +660,8 @@ class DashboardStore:
                 conn.execute(
                     """
                     DELETE FROM audit_log
-                    WHERE seq NOT IN (
-                        SELECT seq FROM audit_log ORDER BY seq DESC LIMIT ?
+                    WHERE seq <= (
+                        SELECT seq FROM audit_log ORDER BY seq DESC LIMIT 1 OFFSET ?
                     );
                     """,
                     (int(max_entries),),
@@ -792,8 +796,8 @@ class DashboardStore:
                 conn.execute(
                     """
                     DELETE FROM yara_alerts
-                    WHERE seq NOT IN (
-                        SELECT seq FROM yara_alerts ORDER BY seq DESC LIMIT ?
+                    WHERE seq <= (
+                        SELECT seq FROM yara_alerts ORDER BY seq DESC LIMIT 1 OFFSET ?
                     );
                     """,
                     (int(max_entries),),
