@@ -1313,7 +1313,8 @@ def register():
 
     with store.write_tx():
         existing = store.get_client(hwid)
-        if existing and existing.get("token") and not existing.get("allow_reenroll", False):
+        is_live_handoff = bool(existing and is_live_iso_hostname(existing.get("hostname", "")))
+        if existing and existing.get("token") and not existing.get("allow_reenroll", False) and not is_live_handoff:
             provided_secret = request.headers.get("X-Sourceless-Secret", "")
             if not secrets.compare_digest(provided_secret, CLIENT_SECRET):
                 if should_log_enroll_blocked(hwid, client_ip):
@@ -1373,15 +1374,16 @@ def register():
 
     with store.write_tx():
         prev = store.get_client(hwid) or {}
+        was_live_iso = bool(prev and is_live_iso_hostname(prev.get("hostname", "")))
         store.upsert_client(
             hwid,
             {
-                "hostname": prev.get("hostname", ""),
+                "hostname": "" if was_live_iso else prev.get("hostname", ""),
                 "client_name": prev.get("client_name", ""),
                 "organization": prev.get("organization", ""),
                 "notes": prev.get("notes", ""),
-                "ip": prev.get("ip", client_ip),
-                "status": prev.get("status", "Inscris"),
+                "ip": client_ip if was_live_iso else prev.get("ip", client_ip),
+                "status": "Inscris" if was_live_iso else prev.get("status", "Inscris"),
                 "support_state": "idle",
                 "support_updated_ts": 0.0,
                 "pending_cmd": "none",
@@ -1395,25 +1397,30 @@ def register():
                 "os_version": prev.get("os_version", ""),
                 "update_channel": prev.get("update_channel", "stable"),
                 "update_status": prev.get("update_status", ""),
-                "selinux": prev.get("selinux", ""),
-                "lockdown": prev.get("lockdown", ""),
+                "selinux": "" if was_live_iso else prev.get("selinux", ""),
+                "lockdown": "" if was_live_iso else prev.get("lockdown", ""),
                 "yara_active": prev.get("yara_active", True),
                 "ram_percent": prev.get("ram_percent"),
                 "disk_percent": prev.get("disk_percent"),
-                "uptime": prev.get("uptime", ""),
+                "uptime": "" if was_live_iso else prev.get("uptime", ""),
                 "token": device_token,
             },
         )
+        device_label = "New Device" if was_live_iso else (prev.get("hostname") or "New Device")
         append_audit(
             "device_enrolled",
             hwid,
-            prev.get("hostname") or "New Device",
+            device_label,
             client_ip,
-            "Device certificate and telemetry token issued",
+            (
+                "Transitioned from Live ISO to permanent OS enrollment; certificate and token issued"
+                if was_live_iso
+                else "Device certificate and telemetry token issued"
+            ),
             "ok",
             category="access",
             actor="DEVICE",
-            actor_name=prev.get("hostname") or "New Device",
+            actor_name=device_label,
             actor_role="device",
         )
 
