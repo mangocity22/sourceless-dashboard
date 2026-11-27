@@ -21,6 +21,7 @@ if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
 from db import DashboardStore
+from redis_cache import FleetRedisCache
 
 ENV_FILE = "/etc/sourceless-dashboard.env"
 
@@ -118,16 +119,8 @@ _enroll_blocked_lock = threading.Lock()
 _enroll_blocked_last_logged = {}
 
 FLEET_CACHE_TTL_SECONDS = 2.0
-_fleet_cache_lock = threading.Lock()
-_fleet_cache_ts = 0.0
-_fleet_cache_payload = None
-
-
-def invalidate_fleet_cache():
-    global _fleet_cache_ts, _fleet_cache_payload
-    with _fleet_cache_lock:
-        _fleet_cache_ts = 0.0
-        _fleet_cache_payload = None
+DATABASE_URL = get_cfg("DATABASE_URL", "")
+REDIS_URL = get_cfg("REDIS_URL", "")
 
 
 def should_log_enroll_blocked(hwid, client_ip):
@@ -159,10 +152,17 @@ HWID_REGEX = re.compile(r"^[a-zA-Z0-9\-]{16,64}$")
 USERNAME_REGEX = re.compile(r"^[a-zA-Z0-9_.-]{3,32}$")
 UPTIME_RE = re.compile(r"^(?:(\d+)d\s+)?(\d+)h\s+(\d+)m$")
 
-store = DashboardStore(DATA_DIR)
+store = DashboardStore(DATA_DIR, database_url=DATABASE_URL)
+store.migrate_from_sqlite(os.path.join(DATA_DIR, "sourceless.db"))
 store.migrate_legacy_json(
     {"clients": DB_FILE, "audit": AUDIT_FILE, "yara": YARA_FILE, "users": USERS_FILE},
     get_local_time(),
+)
+fleet_cache = FleetRedisCache(
+    redis_url=REDIS_URL,
+    heartbeat_ttl=300,
+    pgsync_ttl=300,
+    fleet_cache_ttl=FLEET_CACHE_TTL_SECONDS,
 )
 app.secret_key = get_cfg("DASHBOARD_SECRET_KEY") or store.get_or_create_secret(
     "session_secret", lambda: secrets.token_hex(32)
@@ -508,7 +508,7 @@ def apply_security_headers(response):
     else:
         response.headers["Cache-Control"] = "no-store, max-age=0"
     if request.method in ("POST", "PUT", "DELETE", "PATCH") and request.path != "/api/report":
-        invalidate_fleet_cache()
+        fleet_cache.invalidate_fleet_snapshot()
     return response
 
 
@@ -631,6 +631,7 @@ def api_health():
         {
             "status": "ok",
             "db_mode": store.get_journal_mode(),
+            "redis": fleet_cache.status_label(),
             "clients": store.count_clients(),
         }
     ), 200
@@ -639,7 +640,6 @@ def api_health():
 @app.route("/api/data")
 @login_required
 def api_data():
-    global _fleet_cache_ts, _fleet_cache_payload
     now_ts = time.time()
     current_user_payload = {
         "username": session.get("username", ADMIN_USER),
@@ -647,13 +647,32 @@ def api_data():
         "role": session.get("role", "support"),
     }
 
-    with _fleet_cache_lock:
-        if _fleet_cache_payload is not None and (now_ts - _fleet_cache_ts) < FLEET_CACHE_TTL_SECONDS:
-            cached = dict(_fleet_cache_payload)
-            cached["current_user"] = current_user_payload
-            return jsonify(cached)
+    cached = fleet_cache.get_fleet_snapshot()
+    if cached is not None:
+        resp = dict(cached)
+        resp["current_user"] = current_user_payload
+        return jsonify(resp)
 
     clients = store.list_clients()
+    live_hbs = fleet_cache.get_heartbeats_bulk(list(clients.keys()))
+    for hwid, hb in live_hbs.items():
+        info = clients.get(hwid)
+        if not info:
+            continue
+        db_seen_ts = float(info.get("last_seen_ts") or 0.0)
+        if hb.get("last_seen_ts", 0.0) >= db_seen_ts:
+            if hb.get("last_seen"):
+                info["last_seen"] = hb["last_seen"]
+            info["last_seen_ts"] = hb["last_seen_ts"]
+            if hb.get("ram_percent") is not None:
+                info["ram_percent"] = hb["ram_percent"]
+            if hb.get("disk_percent") is not None:
+                info["disk_percent"] = hb["disk_percent"]
+            if hb.get("uptime"):
+                info["uptime"] = hb["uptime"]
+            if hb.get("ip"):
+                info["ip"] = hb["ip"]
+
     expired_sessions = []
     for hwid, info in clients.items():
         seen_ts = compute_last_seen_ts(info)
@@ -725,9 +744,7 @@ def api_data():
         "organizations": orgs,
         "yara_alerts": recent_yara,
     }
-    with _fleet_cache_lock:
-        _fleet_cache_ts = time.time()
-        _fleet_cache_payload = snapshot
+    fleet_cache.set_fleet_snapshot(snapshot)
 
     response_payload = dict(snapshot)
     response_payload["current_user"] = current_user_payload
@@ -1018,6 +1035,7 @@ def delete_client(hwid):
     with store.write_tx():
         removed = store.delete_client(hwid)
         if removed:
+            fleet_cache.delete_heartbeat(hwid)
             append_audit(
                 "device_deleted",
                 hwid,
@@ -1201,13 +1219,16 @@ def api_cleanup_live_iso():
     removed = 0
     with store.write_tx():
         clients = store.list_clients()
+        live_hbs = fleet_cache.get_heartbeats_bulk(list(clients.keys()))
         for hwid, info in clients.items():
             if not is_live_iso_hostname(info.get("hostname", "")):
                 continue
-            seen_ts = compute_last_seen_ts(info)
+            hb_ts = float((live_hbs.get(hwid) or {}).get("last_seen_ts") or 0.0)
+            seen_ts = max(compute_last_seen_ts(info), hb_ts)
             is_online = seen_ts > 0 and (now_ts - seen_ts) <= ONLINE_THRESHOLD_SECONDS
             if not is_online:
                 if store.delete_client(hwid):
+                    fleet_cache.delete_heartbeat(hwid)
                     removed += 1
         append_audit(
             "live_iso_cleaned",
@@ -1595,27 +1616,101 @@ def report_status():
     if not is_valid_hwid(hwid):
         return jsonify({"error": "Invalid HWID"}), 400
 
+    current_client = store.get_client(hwid) or {}
+    expected_token = current_client.get("token") if hwid else None
+    if not expected_token or not secrets.compare_digest(request.headers.get("X-Sourceless-Token", ""), expected_token):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    if not hwid or not hostname or not status:
+        return jsonify({"error": "Incomplete data."}), 400
+
+    hb = fleet_cache.get_heartbeat(hwid)
+    if hb and hb.get("last_seen_ts", 0.0) >= compute_last_seen_ts(current_client):
+        current_client["last_seen_ts"] = hb["last_seen_ts"]
+        if hb.get("last_seen"):
+            current_client["last_seen"] = hb["last_seen"]
+        if hb.get("uptime"):
+            current_client["uptime"] = hb["uptime"]
+        if hb.get("ip"):
+            current_client["ip"] = hb["ip"]
+
+    now_ts = time.time()
+    now_str = get_local_time()
+    hostname_str = str(hostname)[:80]
+    status_str = str(status)
+    os_version = str(data.get("os_version") or current_client.get("os_version", ""))[:64]
+    update_channel = str(data.get("update_channel") or current_client.get("update_channel", "stable"))[:24]
+    update_status = str(data.get("update_status") or current_client.get("update_status", ""))[:32]
+    selinux = str(data.get("selinux") or current_client.get("selinux", ""))[:24]
+    lockdown = str(data.get("lockdown") or current_client.get("lockdown", ""))[:32]
+    uptime = str(data.get("uptime") or current_client.get("uptime", ""))[:32]
+    ram_pct = clamp_pct(data.get("ram_percent")) if data.get("ram_percent") is not None else current_client.get("ram_percent")
+    disk_pct = clamp_pct(data.get("disk_percent")) if data.get("disk_percent") is not None else current_client.get("disk_percent")
+    yara_active = data.get("yara_active") if isinstance(data.get("yara_active"), bool) else current_client.get("yara_active", True)
+
+    prev_seen_ts = compute_last_seen_ts(current_client)
+    prev_uptime = current_client.get("uptime", "")
+    s_state = current_client.get("support_state", "idle")
+    support_ts = float(current_client.get("support_updated_ts") or 0.0)
+    needs_support_autoclose = False
+    if s_state in ("approved", "waiting"):
+        prev_mins = parse_uptime_minutes(prev_uptime)
+        new_mins = parse_uptime_minutes(uptime)
+        if prev_mins is not None and new_mins is not None and new_mins < prev_mins:
+            needs_support_autoclose = True
+        elif s_state == "approved" and prev_seen_ts > 0 and (now_ts - max(prev_seen_ts, support_ts)) > ONLINE_THRESHOLD_SECONDS:
+            needs_support_autoclose = True
+
+    has_pending_action = bool(current_client.get("pending_cmd") or current_client.get("pending_reinstate"))
+    state_changed = (
+        hostname_str != str(current_client.get("hostname", ""))
+        or status_str != str(current_client.get("status", ""))
+        or os_version != str(current_client.get("os_version", ""))
+        or update_channel != str(current_client.get("update_channel", "stable"))
+        or update_status != str(current_client.get("update_status", ""))
+        or selinux != str(current_client.get("selinux", ""))
+        or lockdown != str(current_client.get("lockdown", ""))
+        or bool(yara_active) != bool(current_client.get("yara_active", True))
+        or client_ip != str(current_client.get("ip", ""))
+    )
+
+    hb_payload = {
+        "last_seen": now_str,
+        "last_seen_ts": now_ts,
+        "ram_percent": ram_pct,
+        "disk_percent": disk_pct,
+        "uptime": uptime,
+        "ip": client_ip,
+    }
+    needs_db_write = (
+        has_pending_action
+        or needs_support_autoclose
+        or state_changed
+        or fleet_cache.should_flush_to_db(hwid)
+    )
+
+    if not needs_db_write:
+        fleet_cache.record_heartbeat(hwid, hb_payload)
+        return jsonify({"message": "Status received", "command": "none"}), 200
+
+    command = "none"
     with store.write_tx():
         current_client = store.get_client(hwid) or {}
-        expected_token = current_client.get("token") if hwid else None
-        if not expected_token or not secrets.compare_digest(request.headers.get("X-Sourceless-Token", ""), expected_token):
-            return jsonify({"error": "Unauthorized"}), 401
+        if hb and hb.get("last_seen_ts", 0.0) >= compute_last_seen_ts(current_client):
+            current_client["last_seen_ts"] = hb["last_seen_ts"]
+            if hb.get("last_seen"):
+                current_client["last_seen"] = hb["last_seen"]
+            if hb.get("uptime"):
+                current_client["uptime"] = hb["uptime"]
 
-        if not hwid or not hostname or not status:
-            return jsonify({"error": "Incomplete data."}), 400
-
-        command = "none"
-        now_ts = time.time()
         prev_status = current_client.get("status")
         prev_seen_ts = compute_last_seen_ts(current_client)
         prev_uptime = current_client.get("uptime", "")
-        incoming_uptime = str(data.get("uptime") or current_client.get("uptime", ""))[:32]
-
         s_state = current_client.get("support_state", "idle")
         support_ts = float(current_client.get("support_updated_ts") or 0.0)
         if s_state in ("approved", "waiting"):
             prev_mins = parse_uptime_minutes(prev_uptime)
-            new_mins = parse_uptime_minutes(incoming_uptime)
+            new_mins = parse_uptime_minutes(uptime)
             if prev_mins is not None and new_mins is not None and new_mins < prev_mins:
                 auto_close_support_session(
                     current_client,
@@ -1635,62 +1730,53 @@ def report_status():
 
         pending_cmd = current_client.get("pending_cmd", "")
         pending_reinstate = current_client.get("pending_reinstate", False)
+        status_final = status_str
 
         if pending_cmd:
             command = pending_cmd
             current_client["pending_cmd"] = ""
         elif pending_reinstate:
             command = "clear_tamper"
-            status = "Integru"
+            status_final = "Integru"
             pending_reinstate = False
 
-        if prev_status and prev_status != status and status != "Integru":
+        if prev_status and prev_status != status_final and status_final != "Integru":
             append_audit(
                 "tamper_detected",
                 hwid,
-                hostname,
+                hostname_str,
                 client_ip,
                 "System integrity status changed to Modified",
                 "critical",
                 category="security",
                 actor="DEVICE",
-                actor_name=hostname,
+                actor_name=hostname_str,
                 actor_role="device",
             )
-        elif prev_status and prev_status != "Integru" and status == "Integru":
+        elif prev_status and prev_status != "Integru" and status_final == "Integru":
             append_audit(
                 "status_restored",
                 hwid,
-                hostname,
+                hostname_str,
                 client_ip,
                 "System integrity verified as Intact",
                 "ok",
                 category="security",
                 actor="DEVICE",
-                actor_name=hostname,
+                actor_name=hostname_str,
                 actor_role="device",
             )
-
-        os_version = str(data.get("os_version") or current_client.get("os_version", ""))[:64]
-        update_channel = str(data.get("update_channel") or current_client.get("update_channel", "stable"))[:24]
-        update_status = str(data.get("update_status") or current_client.get("update_status", ""))[:32]
-        selinux = str(data.get("selinux") or current_client.get("selinux", ""))[:24]
-        lockdown = str(data.get("lockdown") or current_client.get("lockdown", ""))[:32]
-        uptime = str(data.get("uptime") or current_client.get("uptime", ""))[:32]
-        ram_pct = clamp_pct(data.get("ram_percent")) if data.get("ram_percent") is not None else current_client.get("ram_percent")
-        disk_pct = clamp_pct(data.get("disk_percent")) if data.get("disk_percent") is not None else current_client.get("disk_percent")
-        yara_active = data.get("yara_active") if isinstance(data.get("yara_active"), bool) else current_client.get("yara_active", True)
 
         store.upsert_client(
             hwid,
             {
-                "hostname": hostname,
+                "hostname": hostname_str,
                 "client_name": current_client.get("client_name", ""),
                 "organization": current_client.get("organization", ""),
                 "notes": current_client.get("notes", ""),
                 "ip": client_ip,
-                "status": status,
-                "last_seen": get_local_time(),
+                "status": status_final,
+                "last_seen": now_str,
                 "last_seen_ts": now_ts,
                 "pending_reinstate": pending_reinstate,
                 "rustdesk_id": current_client.get("rustdesk_id", "N/A"),
@@ -1712,6 +1798,11 @@ def report_status():
                 "token": expected_token,
             },
         )
+
+    fleet_cache.record_heartbeat(hwid, hb_payload)
+    fleet_cache.mark_db_flushed(hwid)
+    if state_changed or has_pending_action or needs_support_autoclose:
+        fleet_cache.invalidate_fleet_snapshot()
 
     return jsonify({"message": "Status received", "command": command}), 200
 

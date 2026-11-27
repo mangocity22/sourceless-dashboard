@@ -6,6 +6,15 @@ import threading
 import time
 import uuid
 
+try:
+    import psycopg2 as _psycopg2
+    import psycopg2.extras as _psycopg2_extras
+    import psycopg2.pool as _psycopg2_pool
+except ImportError:
+    _psycopg2 = None
+    _psycopg2_extras = None
+    _psycopg2_pool = None
+
 CLIENT_COLUMNS = frozenset(
     {
         "hostname",
@@ -87,25 +96,44 @@ def _to_nullable_int(val):
 
 def _escape_like(term):
     return (
-        term.replace("\\", "\\\\")
-        .replace("%", "\\%")
-        .replace("_", "\\_")
+        term.replace("!", "!!")
+        .replace("%", "!%")
+        .replace("_", "!_")
     )
 
 
 class DashboardStore:
-    """Thread-safe and multi-worker-safe SQLite (WAL) store for SourceLess Fleet Console."""
+    """Dual-backend store for SourceLess Fleet Console (PostgreSQL pool or SQLite WAL fallback)."""
 
-    def __init__(self, data_dir):
+    def __init__(self, data_dir, database_url=None):
         self.data_dir = data_dir
         os.makedirs(self.data_dir, exist_ok=True)
         self.db_path = os.path.join(self.data_dir, "sourceless.db")
+        self.database_url = (database_url or "").strip()
+        self.is_postgres = self.database_url.startswith(("postgres://", "postgresql://"))
+
         self._lock = threading.RLock()
         self._shared_conn = None
         self._tx_depth = 0
+        self._pg_pool = None
+        self._pg_local = threading.local()
+
+        if self.is_postgres:
+            if _psycopg2 is None:
+                raise RuntimeError(
+                    "DATABASE_URL is configured for PostgreSQL, but psycopg2 is not installed."
+                )
+            self._pg_pool = _psycopg2_pool.ThreadedConnectionPool(
+                minconn=2,
+                maxconn=20,
+                dsn=self.database_url,
+            )
+
         self.init_schema()
 
     def _conn(self):
+        if self.is_postgres:
+            raise RuntimeError("Direct _conn() is only supported in SQLite mode.")
         with self._lock:
             if self._shared_conn is None:
                 conn = sqlite3.connect(
@@ -124,7 +152,67 @@ class DashboardStore:
                 self._tx_depth = 0
             return self._shared_conn
 
+    def _exec(self, conn, sql, params=None):
+        if self.is_postgres:
+            sql_pg = sql.replace("?", "%s")
+            cur = conn.cursor(cursor_factory=_psycopg2_extras.RealDictCursor)
+            cur.execute(sql_pg, tuple(params) if params is not None else ())
+            return cur
+        return conn.execute(sql, params or ())
+
+    def _query_one(self, sql, params=None):
+        if self.is_postgres:
+            active_conn = getattr(self._pg_local, "conn", None)
+            if active_conn is not None:
+                cur = self._exec(active_conn, sql, params)
+                try:
+                    return cur.fetchone()
+                finally:
+                    cur.close()
+            conn = self._pg_pool.getconn()
+            try:
+                conn.autocommit = True
+                cur = self._exec(conn, sql, params)
+                try:
+                    return cur.fetchone()
+                finally:
+                    cur.close()
+            finally:
+                self._pg_pool.putconn(conn)
+        with self._lock:
+            return self._conn().execute(sql, params or ()).fetchone()
+
+    def _query_all(self, sql, params=None):
+        if self.is_postgres:
+            active_conn = getattr(self._pg_local, "conn", None)
+            if active_conn is not None:
+                cur = self._exec(active_conn, sql, params)
+                try:
+                    return cur.fetchall()
+                finally:
+                    cur.close()
+            conn = self._pg_pool.getconn()
+            try:
+                conn.autocommit = True
+                cur = self._exec(conn, sql, params)
+                try:
+                    return cur.fetchall()
+                finally:
+                    cur.close()
+            finally:
+                self._pg_pool.putconn(conn)
+        with self._lock:
+            return self._conn().execute(sql, params or ()).fetchall()
+
     def close(self):
+        if self.is_postgres:
+            if self._pg_pool is not None:
+                try:
+                    self._pg_pool.closeall()
+                except Exception:
+                    pass
+                self._pg_pool = None
+            return
         with self._lock:
             if self._shared_conn is not None:
                 try:
@@ -138,6 +226,36 @@ class DashboardStore:
 
     @contextmanager
     def write_tx(self):
+        if self.is_postgres:
+            depth = getattr(self._pg_local, "depth", 0)
+            if depth == 0:
+                conn = self._pg_pool.getconn()
+                conn.autocommit = False
+                self._pg_local.conn = conn
+            else:
+                conn = self._pg_local.conn
+            self._pg_local.depth = depth + 1
+            try:
+                yield conn
+                if depth == 0:
+                    conn.commit()
+            except BaseException:
+                if depth == 0:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                raise
+            finally:
+                self._pg_local.depth = depth
+                if depth == 0:
+                    self._pg_local.conn = None
+                    try:
+                        self._pg_pool.putconn(conn)
+                    except Exception:
+                        pass
+            return
+
         with self._lock:
             conn = self._conn()
             depth = self._tx_depth
@@ -160,17 +278,24 @@ class DashboardStore:
                     conn.execute("COMMIT;")
 
     def get_journal_mode(self):
+        if self.is_postgres:
+            try:
+                row = self._query_one("SELECT 1 AS ok;")
+                return "postgresql" if row else "error"
+            except Exception:
+                return "error"
         with self._lock:
             row = self._conn().execute("PRAGMA journal_mode;").fetchone()
             return str(row[0]).lower() if row else ""
 
     def count_clients(self):
-        with self._lock:
-            row = self._conn().execute("SELECT COUNT(*) FROM clients;").fetchone()
-            return int(row[0]) if row else 0
+        row = self._query_one("SELECT COUNT(*) AS cnt FROM clients;")
+        return int(row["cnt"]) if row else 0
 
     def backup_to(self, dest_path):
         """Creates a consistent online WAL-safe SQLite backup at dest_path."""
+        if self.is_postgres:
+            raise RuntimeError("backup_to() is for SQLite mode; use pg_dump for PostgreSQL.")
         with self._lock:
             src = self._conn()
             dst = sqlite3.connect(dest_path)
@@ -180,6 +305,117 @@ class DashboardStore:
                 dst.close()
 
     def init_schema(self):
+        if self.is_postgres:
+            ddl_statements = (
+                """
+                CREATE TABLE IF NOT EXISTS meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS clients (
+                    hwid TEXT PRIMARY KEY,
+                    hostname TEXT NOT NULL DEFAULT '',
+                    client_name TEXT NOT NULL DEFAULT '',
+                    organization TEXT NOT NULL DEFAULT '',
+                    notes TEXT NOT NULL DEFAULT '',
+                    ip TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'Inscris',
+                    last_seen TEXT NOT NULL DEFAULT '',
+                    last_seen_ts DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+                    pending_reinstate SMALLINT NOT NULL DEFAULT 0,
+                    rustdesk_id TEXT NOT NULL DEFAULT 'N/A',
+                    rustdesk_pw TEXT NOT NULL DEFAULT 'N/A',
+                    support_state TEXT NOT NULL DEFAULT 'idle',
+                    support_updated_ts DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+                    pending_cmd TEXT NOT NULL DEFAULT '',
+                    allow_reenroll SMALLINT NOT NULL DEFAULT 0,
+                    revoked SMALLINT NOT NULL DEFAULT 0,
+                    os_version TEXT NOT NULL DEFAULT '',
+                    update_channel TEXT NOT NULL DEFAULT 'stable',
+                    update_status TEXT NOT NULL DEFAULT '',
+                    selinux TEXT NOT NULL DEFAULT '',
+                    lockdown TEXT NOT NULL DEFAULT '',
+                    yara_active SMALLINT NOT NULL DEFAULT 1,
+                    ram_percent INTEGER,
+                    disk_percent INTEGER,
+                    uptime TEXT NOT NULL DEFAULT '',
+                    token TEXT NOT NULL DEFAULT ''
+                );
+                """,
+                "CREATE INDEX IF NOT EXISTS idx_clients_last_seen_ts ON clients(last_seen_ts);",
+                "CREATE INDEX IF NOT EXISTS idx_clients_support_state ON clients(support_state);",
+                "CREATE INDEX IF NOT EXISTS idx_clients_organization ON clients(organization);",
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    username TEXT PRIMARY KEY,
+                    full_name TEXT NOT NULL DEFAULT '',
+                    role TEXT NOT NULL DEFAULT 'support',
+                    password_hash TEXT NOT NULL DEFAULT '',
+                    active SMALLINT NOT NULL DEFAULT 1,
+                    protected SMALLINT NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT '',
+                    created_by TEXT NOT NULL DEFAULT 'system',
+                    last_login TEXT NOT NULL DEFAULT ''
+                );
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS audit_log (
+                    seq BIGSERIAL PRIMARY KEY,
+                    id TEXT NOT NULL,
+                    time TEXT NOT NULL,
+                    ts DOUBLE PRECISION NOT NULL,
+                    actor TEXT NOT NULL,
+                    actor_name TEXT NOT NULL,
+                    actor_role TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    type TEXT NOT NULL,
+                    severity TEXT NOT NULL,
+                    hwid TEXT NOT NULL,
+                    hostname TEXT NOT NULL,
+                    client_label TEXT NOT NULL,
+                    ip TEXT NOT NULL,
+                    detail TEXT NOT NULL,
+                    reason TEXT NOT NULL DEFAULT ''
+                );
+                """,
+                "CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts DESC, seq DESC);",
+                "CREATE INDEX IF NOT EXISTS idx_audit_hwid ON audit_log(hwid, seq DESC);",
+                "CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_log(actor);",
+                "CREATE INDEX IF NOT EXISTS idx_audit_category ON audit_log(category);",
+                "CREATE INDEX IF NOT EXISTS idx_audit_severity ON audit_log(severity);",
+                """
+                CREATE TABLE IF NOT EXISTS yara_alerts (
+                    seq BIGSERIAL PRIMARY KEY,
+                    id TEXT NOT NULL,
+                    time TEXT NOT NULL,
+                    ts DOUBLE PRECISION NOT NULL,
+                    hwid TEXT NOT NULL,
+                    hostname TEXT NOT NULL,
+                    client_label TEXT NOT NULL,
+                    filename TEXT NOT NULL,
+                    rule TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    quarantine_path TEXT NOT NULL
+                );
+                """,
+                "CREATE INDEX IF NOT EXISTS idx_yara_seq ON yara_alerts(seq DESC);",
+                """
+                CREATE TABLE IF NOT EXISTS login_attempts (
+                    ip TEXT PRIMARY KEY,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    blocked_until DOUBLE PRECISION NOT NULL DEFAULT 0.0
+                );
+                """,
+            )
+            with self.write_tx() as conn:
+                for stmt in ddl_statements:
+                    cur = conn.cursor()
+                    cur.execute(stmt)
+                    cur.close()
+            return
+
         with self._lock:
             conn = self._conn()
             conn.executescript(
@@ -292,13 +528,81 @@ class DashboardStore:
                     "ALTER TABLE clients ADD COLUMN organization TEXT NOT NULL DEFAULT '';"
                 )
 
+    def migrate_from_sqlite(self, sqlite_path):
+        """One-time idempotent import of an existing SQLite database into PostgreSQL."""
+        if not self.is_postgres or not sqlite_path or not os.path.isfile(sqlite_path):
+            return False
+
+        with self.write_tx() as conn:
+            migrated_row = self._exec(
+                conn,
+                "SELECT value FROM meta WHERE key = ?;",
+                ("sqlite_migrated_at",),
+            ).fetchone()
+            if migrated_row:
+                return False
+
+            c_cnt = self._exec(conn, "SELECT COUNT(*) AS cnt FROM clients;").fetchone()["cnt"]
+            u_cnt = self._exec(conn, "SELECT COUNT(*) AS cnt FROM users;").fetchone()["cnt"]
+            if int(c_cnt or 0) > 0 or int(u_cnt or 0) > 0:
+                return False
+
+            src = sqlite3.connect(sqlite_path)
+            src.row_factory = sqlite3.Row
+            try:
+                for row in src.execute("SELECT key, value FROM meta;").fetchall():
+                    self._exec(
+                        conn,
+                        """
+                        INSERT INTO meta(key, value) VALUES (?, ?)
+                        ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+                        """,
+                        (str(row["key"]), str(row["value"])),
+                    )
+
+                for row in src.execute("SELECT * FROM clients;").fetchall():
+                    self.upsert_client(row["hwid"], self._row_to_client(row))
+
+                for row in src.execute("SELECT * FROM users;").fetchall():
+                    rec = self._row_to_user(row)
+                    rec["username"] = row["username"]
+                    self.upsert_user(rec)
+
+                for row in src.execute("SELECT * FROM audit_log ORDER BY seq ASC;").fetchall():
+                    self.insert_audit(self._row_to_audit(row), trim=False)
+
+                for row in src.execute("SELECT * FROM yara_alerts ORDER BY seq ASC;").fetchall():
+                    self.insert_yara_alert(self._row_to_yara(row), max_entries=None)
+            finally:
+                src.close()
+
+            self._exec(
+                conn,
+                """
+                INSERT INTO meta(key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+                """,
+                ("sqlite_migrated_at", str(int(time.time()))),
+            )
+
+        backup_path = f"{sqlite_path}.pg-migrated.bak"
+        if os.path.exists(backup_path):
+            backup_path = f"{sqlite_path}.{int(time.time())}.pg-migrated.bak"
+        try:
+            os.replace(sqlite_path, backup_path)
+        except OSError:
+            pass
+        return True
+
     def migrate_legacy_json(self, legacy_paths, timestamp_str):
-        """One-time idempotent import from legacy JSON files into SQLite."""
+        """One-time idempotent import from legacy JSON files into active database."""
         migrated_files = []
         with self.write_tx() as conn:
             clients_path = legacy_paths.get("clients")
-            clients_count = conn.execute("SELECT COUNT(*) FROM clients;").fetchone()[0]
-            if clients_count == 0:
+            clients_count = self._exec(
+                conn, "SELECT COUNT(*) AS cnt FROM clients;"
+            ).fetchone()["cnt"]
+            if int(clients_count or 0) == 0:
                 legacy_clients = _load_json_safe(clients_path, dict)
                 if legacy_clients is not None:
                     for hwid, rec in legacy_clients.items():
@@ -307,8 +611,10 @@ class DashboardStore:
                     migrated_files.append(clients_path)
 
             users_path = legacy_paths.get("users")
-            users_count = conn.execute("SELECT COUNT(*) FROM users;").fetchone()[0]
-            if users_count == 0:
+            users_count = self._exec(
+                conn, "SELECT COUNT(*) AS cnt FROM users;"
+            ).fetchone()["cnt"]
+            if int(users_count or 0) == 0:
                 legacy_users = _load_json_safe(users_path, dict)
                 if legacy_users is not None:
                     for uname, rec in legacy_users.items():
@@ -319,8 +625,10 @@ class DashboardStore:
                     migrated_files.append(users_path)
 
             audit_path = legacy_paths.get("audit")
-            audit_count = conn.execute("SELECT COUNT(*) FROM audit_log;").fetchone()[0]
-            if audit_count == 0:
+            audit_count = self._exec(
+                conn, "SELECT COUNT(*) AS cnt FROM audit_log;"
+            ).fetchone()["cnt"]
+            if int(audit_count or 0) == 0:
                 legacy_audit = _load_json_safe(audit_path, list)
                 if legacy_audit is not None:
                     for rec in reversed(legacy_audit):
@@ -329,8 +637,10 @@ class DashboardStore:
                     migrated_files.append(audit_path)
 
             yara_path = legacy_paths.get("yara")
-            yara_count = conn.execute("SELECT COUNT(*) FROM yara_alerts;").fetchone()[0]
-            if yara_count == 0:
+            yara_count = self._exec(
+                conn, "SELECT COUNT(*) AS cnt FROM yara_alerts;"
+            ).fetchone()["cnt"]
+            if int(yara_count or 0) == 0:
                 legacy_yara = _load_json_safe(yara_path, list)
                 if legacy_yara is not None:
                     for rec in reversed(legacy_yara):
@@ -338,13 +648,21 @@ class DashboardStore:
                             self.insert_yara_alert(rec, max_entries=None)
                     migrated_files.append(yara_path)
 
-            conn.execute(
-                "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?);",
+            self._exec(
+                conn,
+                """
+                INSERT INTO meta(key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+                """,
                 ("schema_version", "1"),
             )
             if migrated_files:
-                conn.execute(
-                    "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?);",
+                self._exec(
+                    conn,
+                    """
+                    INSERT INTO meta(key, value) VALUES (?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+                    """,
                     ("json_migrated_at", str(timestamp_str)),
                 )
 
@@ -360,14 +678,18 @@ class DashboardStore:
 
     def get_or_create_secret(self, key, generator_fn):
         with self.write_tx() as conn:
-            row = conn.execute(
-                "SELECT value FROM meta WHERE key = ?;", (key,)
+            row = self._exec(
+                conn, "SELECT value FROM meta WHERE key = ?;", (key,)
             ).fetchone()
             if row and row["value"]:
                 return row["value"]
             val = generator_fn()
-            conn.execute(
-                "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?);",
+            self._exec(
+                conn,
+                """
+                INSERT INTO meta(key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+                """,
                 (key, val),
             )
             return val
@@ -407,22 +729,17 @@ class DashboardStore:
     def get_client(self, hwid):
         if not hwid:
             return None
-        with self._lock:
-            row = (
-                self._conn()
-                .execute("SELECT * FROM clients WHERE hwid = ?;", (hwid,))
-                .fetchone()
-            )
-            return self._row_to_client(row) if row else None
+        row = self._query_one("SELECT * FROM clients WHERE hwid = ?;", (hwid,))
+        return self._row_to_client(row) if row else None
 
     def list_clients(self):
-        with self._lock:
-            rows = self._conn().execute("SELECT * FROM clients;").fetchall()
-            return {row["hwid"]: self._row_to_client(row) for row in rows}
+        rows = self._query_all("SELECT * FROM clients;")
+        return {row["hwid"]: self._row_to_client(row) for row in rows}
 
     def upsert_client(self, hwid, data):
         with self.write_tx() as conn:
-            conn.execute(
+            self._exec(
+                conn,
                 """
                 INSERT INTO clients (
                     hwid, hostname, client_name, organization, notes, ip, status,
@@ -516,18 +833,18 @@ class DashboardStore:
         values.append(hwid)
         sql = f"UPDATE clients SET {', '.join(assignments)} WHERE hwid = ?;"
         with self.write_tx() as conn:
-            cur = conn.execute(sql, values)
+            cur = self._exec(conn, sql, values)
             return cur.rowcount > 0
 
     def delete_client(self, hwid):
         with self.write_tx() as conn:
-            row = conn.execute(
-                "SELECT * FROM clients WHERE hwid = ?;", (hwid,)
+            row = self._exec(
+                conn, "SELECT * FROM clients WHERE hwid = ?;", (hwid,)
             ).fetchone()
             if not row:
                 return None
             removed = self._row_to_client(row)
-            conn.execute("DELETE FROM clients WHERE hwid = ?;", (hwid,))
+            self._exec(conn, "DELETE FROM clients WHERE hwid = ?;", (hwid,))
             return removed
 
     # --- USERS ---
@@ -548,25 +865,20 @@ class DashboardStore:
     def get_user(self, username):
         if not username:
             return None
-        with self._lock:
-            row = (
-                self._conn()
-                .execute("SELECT * FROM users WHERE username = ?;", (username,))
-                .fetchone()
-            )
-            return self._row_to_user(row) if row else None
+        row = self._query_one("SELECT * FROM users WHERE username = ?;", (username,))
+        return self._row_to_user(row) if row else None
 
     def list_users(self):
-        with self._lock:
-            rows = self._conn().execute("SELECT * FROM users;").fetchall()
-            return [self._row_to_user(row) for row in rows]
+        rows = self._query_all("SELECT * FROM users;")
+        return [self._row_to_user(row) for row in rows]
 
     def upsert_user(self, data):
         username = str(data.get("username", "")).strip()
         if not username:
             raise ValueError("Username is required.")
         with self.write_tx() as conn:
-            conn.execute(
+            self._exec(
+                conn,
                 """
                 INSERT INTO users (
                     username, full_name, role, password_hash, active,
@@ -611,12 +923,14 @@ class DashboardStore:
         values.append(username)
         sql = f"UPDATE users SET {', '.join(assignments)} WHERE username = ?;"
         with self.write_tx() as conn:
-            cur = conn.execute(sql, values)
+            cur = self._exec(conn, sql, values)
             return cur.rowcount > 0
 
     def delete_user(self, username):
         with self.write_tx() as conn:
-            cur = conn.execute("DELETE FROM users WHERE username = ?;", (username,))
+            cur = self._exec(
+                conn, "DELETE FROM users WHERE username = ?;", (username,)
+            )
             return cur.rowcount > 0
 
     # --- AUDIT LOG ---
@@ -642,7 +956,8 @@ class DashboardStore:
 
     def insert_audit(self, entry, trim=True, max_entries=100000):
         with self.write_tx() as conn:
-            conn.execute(
+            self._exec(
+                conn,
                 """
                 INSERT INTO audit_log (
                     id, time, ts, actor, actor_name, actor_role, category,
@@ -673,7 +988,8 @@ class DashboardStore:
                 ),
             )
             if trim and max_entries:
-                conn.execute(
+                self._exec(
+                    conn,
                     """
                     DELETE FROM audit_log
                     WHERE seq <= (
@@ -743,7 +1059,7 @@ class DashboardStore:
                 "detail",
                 "reason",
             )
-            sub = " OR ".join(f"LOWER({c}) LIKE ? ESCAPE '\\'" for c in cols)
+            sub = " OR ".join(f"LOWER({c}) LIKE ? ESCAPE '!'" for c in cols)
             clauses.append(f"({sub})")
             params.extend([like_pat] * len(cols))
 
@@ -754,12 +1070,10 @@ class DashboardStore:
         )
         params.append(limit_val)
 
-        with self._lock:
-            conn = self._conn()
-            rows = conn.execute(sql, params).fetchall()
-            actor_rows = conn.execute(
-                "SELECT DISTINCT actor FROM audit_log WHERE actor != '' ORDER BY actor ASC;"
-            ).fetchall()
+        rows = self._query_all(sql, params)
+        actor_rows = self._query_all(
+            "SELECT DISTINCT actor FROM audit_log WHERE actor != '' ORDER BY actor ASC;"
+        )
 
         results = [self._row_to_audit(row) for row in rows]
         actors = [str(row["actor"]) for row in actor_rows]
@@ -783,7 +1097,8 @@ class DashboardStore:
 
     def insert_yara_alert(self, entry, max_entries=2000):
         with self.write_tx() as conn:
-            conn.execute(
+            self._exec(
+                conn,
                 """
                 INSERT INTO yara_alerts (
                     id, time, ts, hwid, hostname, client_label,
@@ -809,7 +1124,8 @@ class DashboardStore:
                 ),
             )
             if max_entries:
-                conn.execute(
+                self._exec(
+                    conn,
                     """
                     DELETE FROM yara_alerts
                     WHERE seq <= (
@@ -820,32 +1136,27 @@ class DashboardStore:
                 )
 
     def list_yara_alerts(self, limit=60):
-        with self._lock:
-            rows = (
-                self._conn()
-                .execute(
-                    "SELECT * FROM yara_alerts ORDER BY ts DESC, seq DESC LIMIT ?;",
-                    (max(1, int(limit)),),
-                )
-                .fetchall()
-            )
-            return [self._row_to_yara(row) for row in rows]
+        rows = self._query_all(
+            "SELECT * FROM yara_alerts ORDER BY ts DESC, seq DESC LIMIT ?;",
+            (max(1, int(limit)),),
+        )
+        return [self._row_to_yara(row) for row in rows]
 
     def count_yara_alerts(self):
-        with self._lock:
-            row = self._conn().execute("SELECT COUNT(*) FROM yara_alerts;").fetchone()
-            return int(row[0]) if row else 0
+        row = self._query_one("SELECT COUNT(*) AS cnt FROM yara_alerts;")
+        return int(row["cnt"]) if row else 0
 
     def clear_yara_alerts(self):
         with self.write_tx() as conn:
-            cur = conn.execute("DELETE FROM yara_alerts;")
+            cur = self._exec(conn, "DELETE FROM yara_alerts;")
             return int(cur.rowcount or 0)
 
     # --- RATE LIMITING ---
     def is_ip_blocked(self, ip, max_attempts=5):
         now = time.time()
         with self.write_tx() as conn:
-            row = conn.execute(
+            row = self._exec(
+                conn,
                 "SELECT attempts, blocked_until FROM login_attempts WHERE ip = ?;",
                 (ip,),
             ).fetchone()
@@ -856,18 +1167,21 @@ class DashboardStore:
             if blocked_until > now:
                 return True
             if blocked_until <= now and attempts >= max_attempts:
-                conn.execute("DELETE FROM login_attempts WHERE ip = ?;", (ip,))
+                self._exec(conn, "DELETE FROM login_attempts WHERE ip = ?;", (ip,))
             return False
 
     def record_failed_attempt(self, ip, max_attempts=5, lockout_seconds=900):
         now = time.time()
         with self.write_tx() as conn:
-            row = conn.execute(
-                "SELECT attempts FROM login_attempts WHERE ip = ?;", (ip,)
+            row = self._exec(
+                conn,
+                "SELECT attempts FROM login_attempts WHERE ip = ?;",
+                (ip,),
             ).fetchone()
             attempts = (int(row["attempts"]) if row else 0) + 1
             blocked_until = (now + lockout_seconds) if attempts >= max_attempts else 0.0
-            conn.execute(
+            self._exec(
+                conn,
                 """
                 INSERT INTO login_attempts(ip, attempts, blocked_until)
                 VALUES (?, ?, ?)
@@ -880,4 +1194,4 @@ class DashboardStore:
 
     def reset_failed_attempts(self, ip):
         with self.write_tx() as conn:
-            conn.execute("DELETE FROM login_attempts WHERE ip = ?;", (ip,))
+            self._exec(conn, "DELETE FROM login_attempts WHERE ip = ?;", (ip,))
