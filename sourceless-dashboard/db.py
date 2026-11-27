@@ -164,6 +164,21 @@ class DashboardStore:
             row = self._conn().execute("PRAGMA journal_mode;").fetchone()
             return str(row[0]).lower() if row else ""
 
+    def count_clients(self):
+        with self._lock:
+            row = self._conn().execute("SELECT COUNT(*) FROM clients;").fetchone()
+            return int(row[0]) if row else 0
+
+    def backup_to(self, dest_path):
+        """Creates a consistent online WAL-safe SQLite backup at dest_path."""
+        with self._lock:
+            src = self._conn()
+            dst = sqlite3.connect(dest_path)
+            try:
+                src.backup(dst)
+            finally:
+                dst.close()
+
     def init_schema(self):
         with self._lock:
             conn = self._conn()
@@ -206,6 +221,7 @@ class DashboardStore:
 
                 CREATE INDEX IF NOT EXISTS idx_clients_last_seen_ts ON clients(last_seen_ts);
                 CREATE INDEX IF NOT EXISTS idx_clients_support_state ON clients(support_state);
+                CREATE INDEX IF NOT EXISTS idx_clients_organization ON clients(organization);
 
                 CREATE TABLE IF NOT EXISTS users (
                     username TEXT PRIMARY KEY,

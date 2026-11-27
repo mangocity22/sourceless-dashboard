@@ -69,6 +69,11 @@ LOGIN_GATE_ROUTE = get_cfg("LOGIN_GATE_ROUTE", "/auth-console-gate")
 CLIENT_SECRET = get_cfg("DASHBOARD_CLIENT_SECRET", "SourcelessClientAuth2026SecretKey!")
 SUPPORT_KEY_SALT = get_cfg("SUPPORT_KEY_SALT", "SourcelessSecretSalt2026")
 
+if ADMIN_PASS_RAW == "Sourceless2026!":
+    if get_cfg("DASHBOARD_STRICT_ENV", "") == "1":
+        raise RuntimeError("DASHBOARD_ADMIN_PASS must be set in /etc/sourceless-dashboard.env when DASHBOARD_STRICT_ENV=1")
+    sys.stderr.write("[SECURITY WARNING] DASHBOARD_ADMIN_PASS is using default fallback value.\n")
+
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 
@@ -104,13 +109,25 @@ AUDIT_FILE = os.path.join(DATA_DIR, "audit_log.json")
 YARA_FILE = os.path.join(DATA_DIR, "yara_alerts.json")
 USERS_FILE = os.path.join(DATA_DIR, "users.json")
 
-ONLINE_THRESHOLD_SECONDS = 30
+ONLINE_THRESHOLD_SECONDS = 90
 SUPPORT_WAITING_TIMEOUT_SECONDS = 180
 MAX_AUDIT_ENTRIES = 100000
 MAX_YARA_ENTRIES = 2000
 ENROLL_BLOCKED_AUDIT_COOLDOWN_SECONDS = 300
 _enroll_blocked_lock = threading.Lock()
 _enroll_blocked_last_logged = {}
+
+FLEET_CACHE_TTL_SECONDS = 2.0
+_fleet_cache_lock = threading.Lock()
+_fleet_cache_ts = 0.0
+_fleet_cache_payload = None
+
+
+def invalidate_fleet_cache():
+    global _fleet_cache_ts, _fleet_cache_payload
+    with _fleet_cache_lock:
+        _fleet_cache_ts = 0.0
+        _fleet_cache_payload = None
 
 
 def should_log_enroll_blocked(hwid, client_ip):
@@ -480,10 +497,18 @@ def apply_security_headers(response):
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "same-origin"
     response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    is_https = request.is_secure or request.headers.get("X-Forwarded-Proto", "").lower() == "https"
+    if is_https:
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     if request.path.startswith("/static/"):
-        response.headers["Cache-Control"] = "no-cache, must-revalidate"
+        if request.args.get("v") == ASSET_VERSION:
+            response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        else:
+            response.headers["Cache-Control"] = "no-cache, must-revalidate"
     else:
         response.headers["Cache-Control"] = "no-store, max-age=0"
+    if request.method in ("POST", "PUT", "DELETE", "PATCH") and request.path != "/api/report":
+        invalidate_fleet_cache()
     return response
 
 
@@ -599,89 +624,114 @@ def dashboard():
     )
 
 
-# --- CONSOLE DATA & AUDIT APIs ---
+# --- HEALTH & CONSOLE DATA APIs ---
+@app.route("/api/health")
+def api_health():
+    return jsonify(
+        {
+            "status": "ok",
+            "db_mode": store.get_journal_mode(),
+            "clients": store.count_clients(),
+        }
+    ), 200
+
+
 @app.route("/api/data")
 @login_required
 def api_data():
+    global _fleet_cache_ts, _fleet_cache_payload
     now_ts = time.time()
+    current_user_payload = {
+        "username": session.get("username", ADMIN_USER),
+        "display_name": session.get("display_name", ADMIN_USER),
+        "role": session.get("role", "support"),
+    }
+
+    with _fleet_cache_lock:
+        if _fleet_cache_payload is not None and (now_ts - _fleet_cache_ts) < FLEET_CACHE_TTL_SECONDS:
+            cached = dict(_fleet_cache_payload)
+            cached["current_user"] = current_user_payload
+            return jsonify(cached)
+
+    clients = store.list_clients()
+    expired_sessions = []
+    for hwid, info in clients.items():
+        seen_ts = compute_last_seen_ts(info)
+        support_ts = float(info.get("support_updated_ts") or 0.0)
+        s_state = info.get("support_state", "idle")
+        effective_ts = max(seen_ts, support_ts)
+
+        if s_state == "approved" and effective_ts > 0 and (now_ts - effective_ts) > ONLINE_THRESHOLD_SECONDS:
+            expired_sessions.append(
+                (hwid, info, "Remote support session auto-closed (device went offline / shut down)")
+            )
+        elif s_state == "waiting" and support_ts > 0 and (now_ts - support_ts) > SUPPORT_WAITING_TIMEOUT_SECONDS:
+            expired_sessions.append(
+                (hwid, info, "Pending remote support request expired (no response or device offline)")
+            )
+
+    if expired_sessions:
+        with store.write_tx():
+            for hwid, info, reason_text in expired_sessions:
+                auto_close_support_session(info, hwid, reason_text, persist=True)
+
     public_clients = {}
     online_count = 0
     secure_count = 0
     pending_updates = 0
 
-    with store.write_tx():
-        clients = store.list_clients()
-        for hwid, info in clients.items():
-            seen_ts = compute_last_seen_ts(info)
-            support_ts = float(info.get("support_updated_ts") or 0.0)
-            s_state = info.get("support_state", "idle")
-            effective_ts = max(seen_ts, support_ts)
+    for hwid, info in clients.items():
+        seen_ts = compute_last_seen_ts(info)
+        is_online = seen_ts > 0 and (now_ts - seen_ts) <= ONLINE_THRESHOLD_SECONDS
+        if is_online:
+            online_count += 1
+        if not info.get("revoked") and info.get("status") == "Integru":
+            secure_count += 1
+        if info.get("update_status") == "pending_restart":
+            pending_updates += 1
 
-            if s_state == "approved" and effective_ts > 0 and (now_ts - effective_ts) > ONLINE_THRESHOLD_SECONDS:
-                auto_close_support_session(
-                    info,
-                    hwid,
-                    "Remote support session auto-closed (device went offline / shut down)",
-                    persist=True,
-                )
-            elif s_state == "waiting" and support_ts > 0 and (now_ts - support_ts) > SUPPORT_WAITING_TIMEOUT_SECONDS:
-                auto_close_support_session(
-                    info,
-                    hwid,
-                    "Pending remote support request expired (no response or device offline)",
-                    persist=True,
-                )
+        is_live_iso = is_live_iso_hostname(info.get("hostname", ""))
+        sanitized = {k: v for k, v in info.items() if k != "token"}
+        sanitized["last_seen_ts"] = seen_ts
+        sanitized["online"] = is_online
+        sanitized["is_live_iso"] = is_live_iso
+        public_clients[hwid] = sanitized
 
-            is_online = seen_ts > 0 and (now_ts - seen_ts) <= ONLINE_THRESHOLD_SECONDS
-            if is_online:
-                online_count += 1
-            if not info.get("revoked") and info.get("status") == "Integru":
-                secure_count += 1
-            if info.get("update_status") == "pending_restart":
-                pending_updates += 1
-
-            is_live_iso = is_live_iso_hostname(info.get("hostname", ""))
-            sanitized = {k: v for k, v in info.items() if k != "token"}
-            sanitized["last_seen_ts"] = seen_ts
-            sanitized["online"] = is_online
-            sanitized["is_live_iso"] = is_live_iso
-            public_clients[hwid] = sanitized
-
-        total = len(public_clients)
-        orgs = sorted(
-            {
-                (c.get("organization") or "").strip()
-                for c in public_clients.values()
-                if (c.get("organization") or "").strip()
-            }
-        )
-        offline_live_iso = sum(
-            1 for c in public_clients.values() if c["is_live_iso"] and not c["online"]
-        )
-        stats = {
-            "total": total,
-            "online": online_count,
-            "secure": secure_count,
-            "compromised": total - secure_count,
-            "pending_updates": pending_updates,
-            "yara_alerts": store.count_yara_alerts(),
-            "offline_live_iso": offline_live_iso,
-        }
-        recent_yara = store.list_yara_alerts(60)
-
-    return jsonify(
+    total = len(public_clients)
+    orgs = sorted(
         {
-            "clienti": public_clients,
-            "stats": stats,
-            "organizations": orgs,
-            "yara_alerts": recent_yara,
-            "current_user": {
-                "username": session.get("username", ADMIN_USER),
-                "display_name": session.get("display_name", ADMIN_USER),
-                "role": session.get("role", "support"),
-            },
+            (c.get("organization") or "").strip()
+            for c in public_clients.values()
+            if (c.get("organization") or "").strip()
         }
     )
+    offline_live_iso = sum(
+        1 for c in public_clients.values() if c["is_live_iso"] and not c["online"]
+    )
+    stats = {
+        "total": total,
+        "online": online_count,
+        "secure": secure_count,
+        "compromised": total - secure_count,
+        "pending_updates": pending_updates,
+        "yara_alerts": store.count_yara_alerts(),
+        "offline_live_iso": offline_live_iso,
+    }
+    recent_yara = store.list_yara_alerts(60)
+
+    snapshot = {
+        "clienti": public_clients,
+        "stats": stats,
+        "organizations": orgs,
+        "yara_alerts": recent_yara,
+    }
+    with _fleet_cache_lock:
+        _fleet_cache_ts = time.time()
+        _fleet_cache_payload = snapshot
+
+    response_payload = dict(snapshot)
+    response_payload["current_user"] = current_user_payload
+    return jsonify(response_payload)
 
 
 @app.route("/api/audit")

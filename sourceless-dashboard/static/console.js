@@ -1174,9 +1174,17 @@
     if (e.key === 'Escape') closeAllOverlays();
   });
 
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) {
+      refreshDashboard();
+      if (activeView === 'audit') fetchAuditLog();
+    }
+  });
+
   setInterval(() => {
+    if (document.hidden) return;
     refreshDashboard();
     if (activeView === 'audit') fetchAuditLog();
-  }, 2000);
+  }, 4000);
   refreshDashboard();
 })();
